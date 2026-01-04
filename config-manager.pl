@@ -78,15 +78,6 @@ use Text::ParseWords qw(shellwords);
         $log->warn("Konnte Log-Verzeichnis $logdir nicht nutzen. Logging auf STDERR.");
     }
 
-    # ---------------- Mojolicious Secrets ----------------
-    our $sec = $global->{secret};
-    our @secrets = ref($sec) eq 'ARRAY' ? @$sec : ($sec // 'change-this-long-random-secret-please');
-    app->secrets(\@secrets);
-
-    if (grep { defined($_) && $_ eq 'change-this-long-random-secret-please' } @secrets) {
-        $log->warn('[config-manager] WARNING: Standard-Mojolicious Secret wird verwendet! Bitte in global.json anpassen.');
-    }
-
     # ---------------- Security & Verzeichnisse ----------------
     our $api_token   = defined $ENV{API_TOKEN} && $ENV{API_TOKEN} ne '' ? $ENV{API_TOKEN} : $global->{api_token};
     our $allowed_ips = $global->{allowed_ips} // [];
