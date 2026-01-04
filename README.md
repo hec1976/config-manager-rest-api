@@ -104,7 +104,7 @@ cpanm Mojolicious
 Die API wird als normaler Prozess gestartet und laesst sich problemlos als systemd-Service betreiben.
 
 ~~~bash
-./config-manager-agent.pl
+./config-manager.pl
 ~~~
 
 Nach dem Start stellt die API ihre Endpunkte ueber HTTP bereit.
