@@ -1,153 +1,154 @@
 # Config Manager REST API
 
-## Überblick
+<p align="center">
+  <img src="docs/config-manager-rest-api.png" alt="Config Manager REST API" width="900">
+</p>
 
-Der **Config Manager** ist ein gehärteter REST-basierter Konfigurationsdienst auf Basis von **Mojolicious::Lite**.
-Er dient zur zentralen Verwaltung von Konfigurationsdateien, inklusive Lesen, Schreiben, Backup, Restore und dem Ausführen definierter Aktionen wie systemctl-Befehle oder Skripte.
+Eine robuste, systemnahe REST API zur **kontrollierten Verwaltung von Konfigurationsdateien** auf Servern.
+Das Projekt richtet sich an Administratoren, Automations-Loesungen und technische Plattformen, die Konfigurationen zentral lesen, schreiben und versionieren muessen, ohne ein Web-UI oder interaktive Bedienung.
 
-Der Dienst ist für produktive Linux-Systeme ausgelegt und legt grossen Wert auf Sicherheit, Nachvollziehbarkeit und atomare Dateizugriffe.
+Der Fokus liegt bewusst auf:
+- technischer Klarheit
+- sicherem Default-Verhalten
+- nachvollziehbaren Aktionen
+- stabiler Integration in bestehende Systeme
 
-Version: 1.7.3
+Kein UI. Kein Framework-Zirkus. Reine API.
 
 ---
 
-## Features
+## Motivation
 
-- REST API zur Verwaltung von Konfigurationsdateien
-- Atomisches Schreiben mit Fallback
-- Automatische Backup-Erstellung mit Versionslimit
-- Wiederherstellung einzelner Backup-Versionen
+In vielen Umgebungen werden Konfigurationsdateien weiterhin direkt auf dem System gepflegt, waehrend Steuerung, Deployment und Monitoring extern stattfinden.
+Diese API schliesst genau diese Luecke.
+
+Sie ermoeglicht:
+- kontrollierten Remote-Zugriff auf Konfigurationsdateien
+- reproduzierbare Aenderungen ueber HTTP
+- saubere Integration in CI/CD, Orchestrierung und Admin-Tools
+- klare Trennung zwischen Steuerung und Ausfuehrung
+
+---
+
+## Eigenschaften
+
+- Reine REST API (JSON)
+- Lesen und Schreiben von Konfigurationsdateien
 - Definierte Aktionen pro Konfiguration
-- systemctl Integration mit Timeout und Subprocess
-- Promise-basierte, nicht blockierende Ausführung
-- Token-basierte Authentisierung
-- IP-basierte Zugriffsbeschraenkung
-- Pfad-Whitelist mit optionalem Audit-Modus
-- Optionales Setzen von User, Group und Mode
-- CORS-Unterstuetzung
-- Umfangreiches Logging
+- Optionaler Backup-Mechanismus
+- Sauberes Fehler- und Statusmodell
+- Systemnahe Ausfuehrung (systemctl, Scripts)
+- Kein Zustand im Serverprozess
 
 ---
 
-## Voraussetzungen
+## Architektur
 
-- Linux mit systemd
-- Perl >= 5.24 empfohlen
-- Mojolicious
-- Benötigte Perl-Module:
-  - Mojolicious::Lite
-  - Mojo::File
-  - Mojo::Promise
-  - Mojo::JSON
-  - Mojo::Date
-  - Net::CIDR
-  - Text::ParseWords
+- Sprache: Perl
+- Framework: Mojolicious::Lite
+- API-Stil: REST, JSON
+- Nebenlaeufigkeit: Mojo::IOLoop + Subprocess
+- Logging: Mojo::Log
+- Laufzeit: systemd, VM oder Container
 
----
-
-## Verzeichnisstruktur
-
-```bash
-config-manager/
-├── config-manager.pl
-├── global.json
-├── configs.json
-├── backup/
-├── tmp/
-└── logs/
-```
----
-
-## Konfigurationsdateien
-
-### global.json (Beispiel)
-
-```bash
-{
-  "listen": "127.0.0.1:3000",
-  "api_token": "SEHR_GEHEIM",
-  "allowed_ips": ["127.0.0.1/32"],
-  "allowed_roots": ["/etc", "/opt"],
-  "logfile": "/var/log/config-manager.log",
-  "backupDir": "./backup",
-  "tmpDir": "./tmp",
-  "maxBackups": 10,
-  "path_guard": "on",
-  "apply_meta": 0
-}
-```
----
-
-### configs.json (Beispiel)
-
-```bash
-{
-  "postfix_main": {
-    "path": "/etc/postfix/main.cf",
-    "service": "postfix",
-    "category": "mail",
-    "actions": {
-      "reload": [],
-      "restart": []
-    },
-    "user": "root",
-    "group": "root",
-    "mode": "0644"
-  }
-}
-```
----
-
-## REST API Endpunkte
-
-```bash
-GET    /
-GET    /configs
-GET    /config/:name
-POST   /config/:name
-GET    /backups/:name
-GET    /backupcontent/:name/:file
-POST   /restore/:name/:file
-POST   /action/:name/:cmd
-GET    /health
-```
----
-
-## Authentisierung
-
-Zugriff erfolgt ueber:
-
-- Header: X-API-Token
-- oder Authorization: Bearer <token>
-
----
-
-## Backups
-
-- Automatische Erstellung vor jedem Schreiben
-- Format: YYYYMMDD_HHMMSS
-- Maximale Anzahl ueber maxBackups konfigurierbar
-- Alte Backups werden automatisch entfernt
+Die API ist zustandslos und blockiert keine Worker bei Systemoperationen.
 
 ---
 
 ## Sicherheit
 
-- Keine Symlink-Zugriffe
-- Pfad-Whitelist mit path_guard
-- Kritische systemctl Befehle gesperrt
-- Argument-Validierung
-- systemctl mit Timeout
-- Kein Blockieren des Eventloops
+Sicherheit ist kein Add-on, sondern Grundannahme:
+
+- IP-basierte Zugriffskontrolle (CIDR)
+- Optionaler API-Token (Header oder Bearer)
+- Strikte Pfad-Kanonisierung
+- Kein Directory Traversal
+- Keine Symlink-Folgen
+- Whitelist-basierte Aktionen
+- Keine impliziten Defaults
+
+Alle sicherheitsrelevanten Ereignisse werden geloggt.
 
 ---
 
-## Starten
+## Typische Einsatzszenarien
 
-perl config-manager.pl daemon
+- Zentrale Verwaltung von Service-Konfigurationen
+- Steuerung von systemd-Services ueber API
+- Automatisierte Konfig-Aenderungen in CI/CD
+- Backup und Restore von Konfigurationsdateien
+- Integration in eigene Admin-Frontends
+- Betrieb in abgeschotteten Management-Netzen
 
 ---
 
-## Lizenz
+## Installation
 
-MIT License
+~~~bash
+git clone https://github.com/hec1976/config-manager-rest-api.git
+cd config-manager-rest-api
+chmod +x config-manager-agent.pl
+~~~
+
+Abhaengigkeiten installieren:
+
+~~~bash
+cpanm Mojolicious
+~~~
+
+---
+
+## Betrieb
+
+Die API wird als normaler Prozess gestartet und laesst sich problemlos als systemd-Service betreiben.
+
+~~~bash
+./config-manager-agent.pl
+~~~
+
+Nach dem Start stellt die API ihre Endpunkte ueber HTTP bereit.
+
+---
+
+## Schnittstelle
+
+Die API stellt ausschliesslich JSON-Endpunkte bereit.
+Alle Antworten sind explizit und maschinenlesbar.
+
+Typische Operationen:
+- Auflisten verfuegbarer Konfigurationen
+- Lesen einer Konfiguration
+- Schreiben einer Konfiguration
+- Ausfuehren definierter Aktionen
+- Auflisten und Wiederherstellen von Backups
+- Health-Check
+
+Die konkrete Auspraegung erfolgt bewusst konfigurationsgetrieben und ist nicht Teil dieser README.
+
+---
+
+## Logging und Nachvollziehbarkeit
+
+- Jeder Request erhaelt eine Request-ID
+- Laufzeiten werden gemessen
+- Rueckgabecodes werden geloggt
+- Fehler werden strukturiert ausgegeben
+
+Das ermoeglicht saubere Analyse und Auditierung.
+
+---
+
+## Abgrenzung
+
+Dieses Projekt ist **kein**:
+- Konfigurationsmanagement-System (wie Ansible, Puppet)
+- UI-Tool
+- State-Engine
+- Policy-Framework
+
+Es ist ein **technischer Baustein**, der bewusst klein gehalten ist.
+
+---
+
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
