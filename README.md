@@ -1,8 +1,6 @@
 # Config Manager REST API
 
-<p align="center">
-  <img src="docs/config-manager-rest-api.png" alt="Config Manager REST API" width="900">
-</p>
+
 
 Eine robuste, systemnahe REST API zur **kontrollierten Verwaltung von Konfigurationsdateien** auf Servern.
 Das Projekt richtet sich an Administratoren, Automations-Loesungen und technische Plattformen, die Konfigurationen zentral lesen, schreiben und versionieren muessen, ohne ein Web-UI oder interaktive Bedienung.
