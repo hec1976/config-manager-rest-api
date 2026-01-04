@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$comment": "Config Manager — configs.json (v1.6.7)",
+  "$comment": "Config Manager — configs.json (v1.7.3)",
   "description": "Definiert die zu verwaltenden Konfigurationen, inkl. Pfade, Aktionen, Berechtigungen und Metadaten.",
 
   "nginx_conf": {
