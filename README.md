@@ -88,7 +88,7 @@ Alle sicherheitsrelevanten Ereignisse werden geloggt.
 ~~~bash
 git clone https://github.com/hec1976/config-manager-rest-api.git
 cd config-manager-rest-api
-chmod +x config-manager-agent.pl
+chmod +x config-manager.pl
 ~~~
 
 Abhaengigkeiten installieren:
