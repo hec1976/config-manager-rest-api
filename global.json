@@ -3,7 +3,6 @@
   "ssl_enable": false,
   "ssl_cert_file": "",
   "ssl_key_file": "",
-  "secret": "change-this-long-random-secret-please",
   "logfile": "/var/log/config-manager.log",
   "backupDir": "./backup",
   "tmpDir": "./tmp",
@@ -19,7 +18,6 @@
     "127.0.0.1/32",
     "::1/128"
   ],
-  "api_token": "changeme",
   "trusted_proxies": [],
   "allow_origins": [
     "*"
