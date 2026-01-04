@@ -1,0 +1,30 @@
+{
+  "listen": "0.0.0.0:8080",
+  "ssl_enable": false,
+  "ssl_cert_file": "",
+  "ssl_key_file": "",
+  "secret": "change-this-long-random-secret-please",
+  "logfile": "/var/log/config-manager.log",
+  "backupDir": "./backup",
+  "tmpDir": "./tmp",
+  "apply_meta": 0,
+  "auto_create_backups": 1,
+  "fsync_dir": 1,
+  "path_guard": "audit",
+  "allowed_roots": [
+    "/etc",
+    "/opt/configs"
+  ],
+  "allowed_ips": [
+    "127.0.0.1/32",
+    "::1/128"
+  ],
+  "api_token": "changeme",
+  "trusted_proxies": [],
+  "allow_origins": [
+    "*"
+  ],
+  "systemctl": "/usr/bin/systemctl",
+  "systemctl_flags": "",
+  "script_timeout": 60
+}

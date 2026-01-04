@@ -1,0 +1,83 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Config Manager — configs.json (v1.6.7)",
+  "description": "Definiert die zu verwaltenden Konfigurationen, inkl. Pfade, Aktionen, Berechtigungen und Metadaten.",
+
+  "nginx_conf": {
+    "path": "/etc/nginx/nginx.conf",
+    "category": "webserver",
+    "service": "nginx",
+    "actions": {
+      "status": [],
+      "reload": [],
+      "restart": ["--no-block"]
+    },
+    "user": "root",
+    "group": "root",
+    "mode": "0644",
+    "apply_meta": true,
+    "backup_dir": "/var/backups/nginx",
+    "max_backups": 5,
+    "description": "Hauptkonfiguration für Nginx. Änderungen erfordern einen Reload oder Restart."
+  },
+
+  "app_env": {
+    "path": "/opt/configs/app.env",
+    "category": "application",
+    "actions": {
+      "run": ["/opt/scripts/restart_app.sh"]
+    },
+    "user": "appuser",
+    "group": "appgroup",
+    "mode": "0640",
+    "apply_meta": true,
+    "description": "Umgebungsvariablen für die Anwendung. Wird beim Deployment aktualisiert.",
+    "validation": {
+      "required_vars": ["DB_HOST", "DB_USER", "API_KEY"],
+      "template": "/opt/templates/app.env.template"
+    }
+  },
+
+  "postfix_main_cf": {
+    "path": "/etc/postfix/main.cf",
+    "category": "mail",
+    "service": "postfix",
+    "actions": {
+      "reload": [],
+      "check": ["postfix", "check"]
+    },
+    "user": "root",
+    "group": "postfix",
+    "mode": "0640",
+    "apply_meta": true,
+    "description": "Postfix-Hauptkonfiguration. Nach Änderungen 'postfix check' ausführen."
+  },
+
+  "cron_jobs": {
+    "path": "/etc/cron.d/app_jobs",
+    "category": "scheduler",
+    "actions": {
+      "validate": ["/usr/bin/crontab", "-c", "/etc/cron.d/app_jobs"]
+    },
+    "user": "root",
+    "group": "root",
+    "mode": "0644",
+    "apply_meta": true,
+    "description": "Cron-Jobs für die Anwendung. Validierung mit 'crontab -c' empfohlen."
+  },
+
+  "ssh_config": {
+    "path": "/etc/ssh/sshd_config",
+    "category": "security",
+    "service": "sshd",
+    "actions": {
+      "restart": [],
+      "test": ["sshd", "-t"]
+    },
+    "user": "root",
+    "group": "root",
+    "mode": "0600",
+    "apply_meta": true,
+    "description": "SSH-Daemon-Konfiguration. Immer mit 'sshd -t' testen!"
+  }
+}
