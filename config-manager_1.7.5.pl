@@ -443,16 +443,22 @@ use Symbol qw(gensym);
 		my ($stdout, $stderr, $rc) = @_;
 		my $txt = lc(($stdout // "") . ($stderr // ""));
 
-		# 1. Suche nach expliziten Statusmeldungen
-		return "running" if $txt =~ /is\s+running/ || $txt =~ /pid:\s*\d+/;
-		return "stopped" if $txt =~ /not\s+running/ || $txt =~ /inactive/ || $txt =~ /stopped/;
+		# 1. Suche nach expliziten Statusmeldungen (inkl. Instanz-Präfixe)
+		return "running" if $txt =~ /is\s+running/
+						  || $txt =~ /pid:\s*\d+/
+						  || $txt =~ /[a-z0-9-]+:\s*the\s+postfix\s+mail\s+system\s+is\s+running/;
+		return "stopped" if $txt =~ /not\s+running/
+						  || $txt =~ /inactive/
+						  || $txt =~ /stopped/
+						  || $txt =~ /[a-z0-9-]+:\s*not\s+running/;
 
-		# 2. Fallback: Exit-Code auswerten, wenn die Ausgabe leer ist
-		return "running" if $rc == 0 && ($txt =~ /postfix/ || $txt eq "");
+		# 2. Fallback: Exit-Code auswerten
+		return "running" if $rc == 0;
 		return "stopped" if $rc == 1;
 
 		return "unknown";
 	}
+
 
     # ==================================================
     # REQUEST-HELFER & ACCESS-CONTROL
