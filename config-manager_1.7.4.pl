@@ -42,7 +42,7 @@ use Symbol qw(gensym);
     umask 0007;
 
     # ---------------- Version & Globale Variablen ----------------
-    our $VERSION = '1.7.3';
+    our $VERSION = '1.7.4';
 
     our $globalfile  = "$Bin/global.json";
     our $configsfile = "$Bin/configs.json";
@@ -445,22 +445,20 @@ use Symbol qw(gensym);
 		my $txt = lc(($stdout // "") . "\n" . ($stderr // ""));
 		$txt =~ s/\r//g;
 
-		# 1) harte "down" Signale
+		# 1) harte "down" Signale, immer zuerst
 		return "stopped" if $txt =~ /\bpostfix mail system is not running\b/;
+		return "stopped" if $txt =~ /\bis\s+not\s+running\b/;
 		return "stopped" if $txt =~ /\bnot\s+running\b/;
 		return "stopped" if $txt =~ /\b(stopp?ed|inactive|dead)\b/;
 		return "stopped" if $txt =~ /\bfatal\b/;
 
-		# 2) harte "up" Signale (dein konkretes Format)
-		# Beispiel: "the Postfix mail system is running: PID: 27418"
-		return "running" if $txt =~ /\bpostfix mail system is running\b/ && $txt =~ /\bpid:\s*\d+\b/;
+		# 2) harte "up" Signale, postfix-script Style
+		return "running" if $txt =~ /\bpostfix mail system is running\b/;
+		return "running" if $txt =~ /\bis\s+running\b/ && $txt =~ /\bpostfix\b/;
 
-		# 3) wenn output leer oder nicht eindeutig: nicht raten
+		# 3) wenn unklar, nicht raten
 		return "unknown";
 	}
-
-
-
 
     # ==================================================
     # REQUEST-HELFER & ACCESS-CONTROL
@@ -875,17 +873,16 @@ use Symbol qw(gensym);
 						return _capture_cmd_promise(10, $bin, @status_args)
 							->then(sub {
 								my ($res) = @_;
+
+								$log->info("postmulti status output name=$name rc=$res->{rc} out=" . ($res->{out} // ''));
 								my $state = parse_postmulti_status($res->{out}, '', $res->{rc});
 
 								my $ok = 0;
-								if ($cmd eq 'status') {
-									$ok = 1;  # status ist Abfrage, nicht Fehler
-								}
-								elsif ($cmd eq 'stop') {
+								if ($cmd eq 'stop') {
 									$ok = ($state eq 'stopped') ? 1 : 0;
-								}
-								else {
-									# start, reload, sonstiges
+								} elsif ($cmd eq 'status') {
+									$ok = 1;
+								} else {
 									$ok = ($state eq 'running') ? 1 : 0;
 								}
 
@@ -897,6 +894,7 @@ use Symbol qw(gensym);
 									output => $res->{out},
 								});
 							});
+
 					}
 
 					# Default-Verhalten (alles andere)
@@ -1030,7 +1028,5 @@ use Symbol qw(gensym);
     if ($global->{ssl_enable}) {
         $listen_url = "https://$global->{listen}?cert=$global->{ssl_cert_file}&key=$global->{ssl_key_file}";
     }
-    app->start('daemon', '-l', $listen_url);
-		
-	
+    app->start('daemon', '-l', $listen_url);	
 }
