@@ -33,6 +33,9 @@ use FindBin qw($Bin);
 use Net::CIDR ();
 use Text::ParseWords qw(shellwords);
 
+use IPC::Open3;
+use Symbol qw(gensym);
+
 # Schutzmechanismus, um mehrfache Deklarationen zu vermeiden
 {
     # ---------------- Umask (grundlegend) ----------------
@@ -317,35 +320,41 @@ use Text::ParseWords qw(shellwords);
 
 			Mojo::IOLoop->subprocess(
 				sub {
-					my ($subprocess) = @_;
-
 					local $SIG{ALRM} = sub { die "__TIMEOUT__\n" };
 					alarm $timeout;
 
 					open(STDIN, '<', '/dev/null') or die "open /dev/null: $!";
 
-					my $out = '';
-					{
-						local $/;
-						$out = qx{@cmd 2>&1};
-					}
-					my $raw = $?;
-					alarm 0;
+					my $err = gensym;
+                my $pid = open3(my $in, my $out, $err, @cmd);
+                close $in;
 
-					my $rc = ($raw >> 8);
-					return { rc => $rc, out => $out };
-				},
-				sub {
-					my ($subprocess, $err, $res) = @_;
-					if (defined $err && length $err) {
-						return $resolve->({ rc => -1, out => $err });
-					}
-					$res ||= { rc => -1, out => '' };
-					return $resolve->($res);
-				}
-			);
-		});
-	}
+                my $stdout = do { local $/; <$out> // "" };
+                my $stderr = do { local $/; <$err> // "" };
+
+                waitpid($pid, 0);
+                alarm 0;
+
+                my $raw = $?;
+                my $rc  = ($raw >> 8);
+
+                return { rc => $rc, out => ($stdout . $stderr) };
+            },
+            sub {
+                my ($subprocess, $err, $res) = @_;
+                if (defined $err && length $err) {
+                    if ($err =~ /__TIMEOUT__/) {
+                        return $resolve->({ rc => -1, out => "timeout nach ${timeout}s" });
+                    }
+                    return $resolve->({ rc => -1, out => $err });
+                }
+                $res ||= { rc => -1, out => '' };
+                return $resolve->($res);
+            }
+        );
+    });
+}
+
 
     # --- Konfigurations-Mapping ---
     our %cfgmap;
@@ -433,12 +442,21 @@ use Text::ParseWords qw(shellwords);
 		my $txt = lc(($stdout // "") . "\n" . ($stderr // ""));
 		$txt =~ s/\r//g;
 
-		return "running" if $txt =~ /\brunning\b/;
-		return "stopped" if $txt =~ /\bstopp?ed\b/;
+		# klare "down" Hinweise
 		return "stopped" if $txt =~ /\bnot\s+running\b/;
+		return "stopped" if $txt =~ /\binactive\b/;
+		return "stopped" if $txt =~ /\bdead\b/;
+		return "stopped" if $txt =~ /\bstopp?ed\b/;
 
-		return ($rc == 0) ? "unknown_ok" : "unknown_fail";
+		# klare "up" Hinweise
+		return "running" if $txt =~ /\bactive\b/ && $txt =~ /\brunning\b/;   # active (running)
+		return "running" if $txt =~ /\brunning\b/;
+
+		# Fallback wenn Output leer oder unklar ist
+		# Bei status ist rc oft die beste Naeherung: 0 ist up, !=0 ist down
+		return ($rc == 0) ? "running" : "stopped";
 	}
+
 
 
     # ==================================================
