@@ -5,7 +5,7 @@
 # FIX 1.7.5:
 # - FIX: parse_postmulti_status erkennt nun Instanz-Präfixe (z.B. postfix-xxxx/...)
 # - IMPROVE: Fallback auf RC=0 bei Status-Abfrage#
-3
+#
 # FIX 1.7.4:
 # - FIX: postmulti actions now re-check status after stop/start/reload
 # - FIX: postmulti status parsed from output, not exit code
@@ -444,33 +444,21 @@ use Symbol qw(gensym);
 
 	sub parse_postmulti_status {
 		my ($stdout, $stderr, $rc) = @_;
-		# Kombiniere stdout und stderr, kleingeschrieben für einfacheren Vergleich
 		my $txt = lc(($stdout // "") . "\n" . ($stderr // ""));
 		$txt =~ s/\r//g;
 
-		# 1) Harte "DOWN" Signale (Stopp-Erkennung hat Vorrang)
-		# Sucht nach "not running", "inactive", "dead" oder "fatal"
-		if ($txt =~ /mail system is not running/ || 
-			$txt =~ /\bis\s+not\s+running/       || 
-			$txt =~ /not\s+running\b/            || 
-			$txt =~ /\b(stopp?ed|inactive|dead)\b/ ||
-			$txt =~ /\bfatal\b/) {
-			return "stopped";
-		}
+		# 1) STOPPED-Erkennung (Priorität)
+		return "stopped" if $txt =~ /mail system is not running/;
+		return "stopped" if $txt =~ /\bis\s+not\s+running/;
+		return "stopped" if $txt =~ /\bnot\s+running\b/;
+		return "stopped" if $txt =~ /\b(stopp?ed|inactive|dead|fatal)\b/;
 
-		# 2) Harte "UP" Signale
-		# Deine Zeile: "postfix-apphost/postfix-script: the Postfix mail system is running: PID: 27418"
-		# Wir suchen nach der Kern-Phrase "mail system is running"
-		if ($txt =~ /mail system is running/ || 
-		   ($txt =~ /is\s+running/ && $txt =~ /postfix/)) {
-			return "running";
-		}
+		# 2) RUNNING-Erkennung (Flexibler für Instanz-Präfixe)
+		return "running" if $txt =~ /mail system is running/;
+		return "running" if $txt =~ /is\s+running/ && $txt =~ /postfix/;
 
-		# 3) Wenn der Exit-Code 0 ist und oben nichts gefunden wurde, 
-		# aber "postfix" im Text vorkommt, ist es meistens auch "running"
-		if ($rc == 0 && $txt =~ /postfix/) {
-			return "running";
-		}
+		# 3) Fallback: Wenn RC 0 ist und "postfix" in der Ausgabe vorkommt
+		return "running" if $rc == 0 && $txt =~ /postfix/;
 
 		return "unknown";
 	}
