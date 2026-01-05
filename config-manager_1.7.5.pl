@@ -324,36 +324,28 @@ use Symbol qw(gensym);
 
 			Mojo::IOLoop->subprocess(
 				sub {
+					my ($subprocess) = @_;
 					local $SIG{ALRM} = sub { die "__TIMEOUT__\n" };
 					alarm $timeout;
 
-					open(STDIN, '<', '/dev/null') or die "open /dev/null: $!";
-
-					my $err = gensym;
-					my $pid = open3(my $in, my $out, $err, @cmd);
-					close $in;
-
-					my $stdout = do { local $/; <$out> // "" };
-					my $stderr = do { local $/; <$err> // "" };
-
-					waitpid($pid, 0);
+					# WICHTIG: STDOUT und STDERR zusammenführen via Shell-Redirect
+					# Wir nutzen die Listen-Form von system für Sicherheit, 
+					# müssen aber STDOUT/ERR im Subprozess umleiten.
+					open(my $oldout, ">&STDOUT");
+					open(STDOUT, ">&STDERR"); # Leite stdout auf stderr um
+					
+					# Führe Befehl aus und fange alles ab
+					my $output = `@cmd 2>&1`; 
+					my $rc = ($? >> 8);
+					
 					alarm 0;
-
-					my $raw = $?;
-					my $rc  = ($raw >> 8);
-
-					return { rc => $rc, out => ($stdout . $stderr) };
+					return { rc => $rc, out => $output // "" };
 				},
 				sub {
 					my ($subprocess, $err, $res) = @_;
-
-					if (defined $err && length $err) {
-						if ($err =~ /__TIMEOUT__/) {
-							return $resolve->({ rc => -1, out => "timeout nach ${timeout}s" });
-						}
-						return $resolve->({ rc => -1, out => $err });
+					if ($err) {
+						return $resolve->({ rc => -1, out => "Fehler: $err" });
 					}
-
 					$res ||= { rc => -1, out => '' };
 					return $resolve->($res);
 				}
@@ -444,31 +436,27 @@ use Symbol qw(gensym);
 
 	sub parse_postmulti_status {
 		my ($stdout, $stderr, $rc) = @_;
-		# Kombiniere alles, entferne ANSI-Farbcodes und mache es kleingeschrieben
 		my $txt = lc(($stdout // "") . ($stderr // ""));
-		$txt =~ s/\e\[[\d;]*[a-zA-Z]//g; # Entfernt Terminal-Farbcodes (falls vorhanden)
+		$txt =~ s/\r//g;
+		$txt =~ s/^\s+|\s+$//g; # Whitespace entfernen
 
-		# 1. PRIORITÄT: Eindeutige "Running" Merkmale
-		# Wir suchen nach "is running" oder der PID-Zeile. 
-		# Wenn das da ist, läuft es - egal was der Exit-Code sagt!
+		# 1. Wenn wir Text haben, ist das unser primärer Indikator
 		if ($txt =~ /is\s+running/ || $txt =~ /pid:\s*\d+/) {
 			return "running";
 		}
-
-		# 2. PRIORITÄT: Eindeutige "Stopped" Merkmale
-		# Wir prüfen auf "not running", aber nur wenn "is running" oben NICHT gematcht hat.
-		if ($txt =~ /not\s+running/ || $txt =~ /inactive/ || $txt =~ /dead/ || $txt =~ /stopped/) {
+		if ($txt =~ /not\s+running/ || $txt =~ /inactive/) {
 			return "stopped";
 		}
 
-		# 3. FALLBACK: Exit-Code Prüfung
-		# Wenn im Text gar nichts gefunden wurde, nutzen wir den RC
-		if (defined $rc) {
-			return "running" if $rc == 0 && $txt =~ /postfix/;
-			return "stopped" if $rc > 0;
+		# 2. Wenn der Output komplett leer ist, aber RC=1: 
+		# Wahrscheinlich läuft die Instanz NICHT oder der Name ist falsch.
+		if ($txt eq "") {
+			return "stopped" if $rc != 0;
+			return "unknown";
 		}
 
-		return "unknown";
+		# 3. Fallback auf Exit-Code
+		return ($rc == 0) ? "running" : "stopped";
 	}
 
     # ==================================================
