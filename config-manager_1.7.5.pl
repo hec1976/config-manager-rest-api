@@ -443,28 +443,28 @@ use Symbol qw(gensym);
 		my ($stdout, $stderr, $rc) = @_;
 		my $txt = lc(($stdout // "") . ($stderr // ""));
 
-		# 1. Suche nach expliziten Statusmeldungen (inkl. Instanz-Präfixe)
+		# 1. Suche nach expliziten Statusmeldungen (inkl. Instanz-Präfixe mit Pfaden/Slashes)
+		# Erkennt: "postfix-apphost/postfix-script: the Postfix mail system is running"
 		return "running" if $txt =~ /is\s+running/
 						  || $txt =~ /pid:\s*\d+/
-						  || $txt =~ /[a-z0-9-]+:\s*the\s+postfix\s+mail\s+system\s+is\s+running/;
+						  || $txt =~ /[\w\-\.\/]+:\s*(the\s+postfix\s+mail\s+system\s+is\s+)?running/;
+
+		# Erkennt: "postfix-webhost/postfix-script: not running"
 		return "stopped" if $txt =~ /not\s+running/
 						  || $txt =~ /inactive/
 						  || $txt =~ /stopped/
-						  || $txt =~ /[a-z0-9-]+:\s*not\s+running/;
+						  || $txt =~ /[\w\-\.\/]+:\s*not\s+running/;
 
-		# 2. Fallback: Exit-Code auswerten
+		# 2. Fallback: Exit-Code auswerten (Postfix status: 0=running, 1=stopped)
 		return "running" if $rc == 0;
 		return "stopped" if $rc == 1;
 
 		return "unknown";
 	}
 
-
-
     # ==================================================
     # REQUEST-HELFER & ACCESS-CONTROL
     # ==================================================
-
     sub _req_meta {
         my ($c) = @_;
         return {
@@ -767,9 +767,9 @@ use Symbol qw(gensym);
 
         my $e = $cfgmap{$name} or return $c->render(json => { ok => 0, error => "Unbekannt" }, status => 404);
 
-        my $svc    = $e->{service} // $name;
-		my $is_postmulti = ($svc =~ m{^exec:/usr/sbin/postmulti$});
-        my $actmap = $e->{actions};
+        my $svc          = $e->{service} // $name;
+        my $is_postmulti = ($svc =~ m{^exec:/usr/sbin/postmulti$});
+        my $actmap       = $e->{actions};
 
         return $c->render(json => { ok => 0, error => 'Aktion nicht erlaubt' }, status => 400)
             unless ref($actmap) eq 'HASH' && exists $actmap->{$cmd};
@@ -781,13 +781,53 @@ use Symbol qw(gensym);
             }
         }
 
-        # Haupt-Promise fuer die gesamte Aktion
         my $action_promise;
 
-        if ($cmd eq 'daemon-reload') {
-            $action_promise = _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'daemon-reload');
+        # --- FALL 1: Postmulti-Speziallogik ---
+        # Muss VOR dem Standard-systemctl kommen, damit 'reload' nicht abgefangen wird
+        if ($is_postmulti) {
+            my ($bin) = ($svc =~ m{^exec:(/.+)$});
+            
+            $action_promise = _capture_cmd_promise(30, $bin, @extra)->then(sub {
+                my ($res) = @_;
 
+                # Kurze Pause für Postfix (Settle Time)
+                if ($cmd =~ /^(stop|start|reload|restart)$/) {
+                    select(undef, undef, undef, 0.6);
+                }
+
+                # Status-Check nach der Aktion
+                my @status_args = @{$actmap->{status} // []};
+                if (!@status_args) { @status_args = ('-i', $name, '-p', 'status'); }
+
+                return _capture_cmd_promise(10, $bin, @status_args)->then(sub {
+                    my ($status_res) = @_;
+                    my $state = parse_postmulti_status($status_res->{out}, '', $status_res->{rc});
+
+                    my $ok = 0;
+                    if    ($cmd eq 'stop')   { $ok = ($state eq 'stopped') ? 1 : 0; }
+                    elsif ($cmd eq 'status') { $ok = 1; }
+                    else                     { $ok = ($state eq 'running') ? 1 : 0; }
+
+                    $c->render(json => {
+                        ok     => $ok,
+                        action => $cmd,
+                        status => $state,
+                        rc     => $res->{rc},
+                        output => $res->{out},
+                    });
+                });
+            });
         }
+        # --- FALL 2: System-weite Befehle ---
+        elsif ($cmd eq 'daemon-reload') {
+            $action_promise = _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'daemon-reload')
+                ->then(sub {
+                    my $rc = shift;
+                    $c->render(json => $rc == 0 ? { ok => 1 } : { ok => 0, error => "Rueckgabewert=$rc" });
+                });
+        }
+        # --- FALL 3: Skripte (Bash, Perl, etc.) ---
         elsif ($svc =~ m{^(bash|sh|perl|exec):(/.+)$}) {
             my ($runner, $script) = ($1, $2);
             return $c->render(json => { ok => 0, error => "Skript nicht gefunden: $script" }, status => 404) unless -f $script;
@@ -803,118 +843,71 @@ use Symbol qw(gensym);
                 : $runner eq 'sh'   ? ('/bin/sh',   $script, @extra)
                 :                    ($script, @extra);
 
-            $action_promise = _capture_cmd_promise(30, @argv)->then(sub { shift->{rc} });
-        }
-        elsif ($svc eq 'systemctl') {
-            # FIX 1.7.1: service="systemctl" bedeutet "systemctl <cmd> <extra...>"
-            if ($cmd =~ /^(poweroff|reboot|halt)$/) {
-                return $c->render(json => { ok => 0, error => 'Verboten' }, status => 400);
-            }
-            $action_promise = _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), $cmd, @extra);
-        }
-        elsif ($cmd eq 'stop_start') {
-            $action_promise =
-                _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'stop', $svc)
-                ->then(sub {
-                    return _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'start', $svc);
-                });
-        }
-        elsif ($cmd eq 'restart') {
-            $action_promise = _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'restart', $svc);
-        }
-        elsif ($cmd eq 'reload') {
-            $action_promise =
-                _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'is-active', $svc)
-                ->then(sub {
-                    my ($rc) = @_;
-                    if ($rc == 0) {
-                        return _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'reload', $svc);
-                    }
-                    return Mojo::Promise->reject("Dienst nicht aktiv");
-                });
-        }
-        else {
-            $action_promise = _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), $cmd, $svc);
-        }
-
-        $action_promise
-            ->then(sub {
-                my ($rc) = @_;
-
-                if ($cmd eq 'daemon-reload' || $svc eq 'systemctl') {
-                    $c->render(json => $rc == 0 ? { ok => 1 } : { ok => 0, error => "Rueckgabewert=$rc" });
-                }
-                elsif ($svc =~ m{^(bash|sh|perl|exec):} && ($extra[0] // '') eq 'is-active') {
+            $action_promise = _capture_cmd_promise(30, @argv)->then(sub {
+                my $res = shift;
+                my $rc = $res->{rc};
+                if (($extra[0] // '') eq 'is-active') {
                     $c->render(json => { ok => 1, status => ($rc == 0 ? 'running' : 'stopped'), rc => $rc });
+                } else {
+                    $c->render(json => { ok => ($rc == 0 ? 1 : 0), rc => $rc, output => $res->{out} });
                 }
-                elsif ($cmd eq 'stop_start' || $cmd eq 'restart' || $cmd eq 'reload') {
+            });
+        }
+        # --- FALL 4: Standard-Systemctl Dienste ---
+        else {
+            if ($cmd eq 'stop_start') {
+                $action_promise = _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'stop', $svc)
+                    ->then(sub { _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'start', $svc) });
+            }
+            elsif ($cmd eq 'restart') {
+                $action_promise = _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'restart', $svc);
+            }
+            elsif ($cmd eq 'reload') {
+                $action_promise = _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'is-active', $svc)
+                    ->then(sub {
+                        my $rc = shift;
+                        return _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'reload', $svc) if $rc == 0;
+                        die "Dienst nicht aktiv\n";
+                    });
+            }
+            elsif ($svc eq 'systemctl') {
+                return $c->render(json => { ok => 0, error => 'Verboten' }, status => 400) if $cmd =~ /^(poweroff|reboot|halt)$/;
+                $action_promise = _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), $cmd, @extra);
+            }
+            else {
+                $action_promise = _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), $cmd, $svc);
+            }
+
+            # Gemeinsamer Abschluss für Standard-Systemctl
+            $action_promise->then(sub {
+                my $rc = shift;
+                if ($cmd =~ /^(stop_start|restart|reload|start|stop)$/) {
                     return _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'is-active', $svc)
                         ->then(sub {
-                            my ($active_rc) = @_;
+                            my $active_rc = shift;
                             $c->render(json => {
-                                ok     => 1,
+                                ok     => ($active_rc == 0 || $cmd eq 'stop' ? 1 : 0),
                                 action => $cmd,
                                 status => ($active_rc == 0 ? 'running' : 'stopped')
                             });
                         });
+                } else {
+                    $c->render(json => { ok => ($rc == 0 ? 1 : 0), rc => $rc });
                 }
-				else {
-					if ($is_postmulti) {
-						my ($bin) = ($svc =~ m{^exec:(/.+)$});
-						
-						# Argumente für den Status-Check ermitteln
-						my @status_args = @{$actmap->{status} // []};
-						if (!@status_args) { @status_args = ('-i', $name, '-p', 'status'); }
-
-						# Kurze Pause für Postfix (Settle Time), damit die PID-Files aktuell sind
-						if ($cmd eq 'stop' || $cmd eq 'start' || $cmd eq 'reload' || $cmd eq 'restart') {
-							select(undef, undef, undef, 0.6);
-						}
-
-						# Jetzt den tatsächlichen Status abfragen
-						return _capture_cmd_promise(10, $bin, @status_args)
-							->then(sub {
-								my ($res) = @_;
-								my $state = parse_postmulti_status($res->{out}, '', $res->{rc});
-
-								# Präzise Erfolgslogik für Postmulti
-								my $ok = 0;
-								if    ($cmd eq 'stop')      { $ok = ($state eq 'stopped') ? 1 : 0; }
-								elsif ($cmd eq 'status')    { $ok = 1; } # Abfrage an sich war erfolgreich
-								else                        { $ok = ($state eq 'running') ? 1 : 0; } # start/reload/restart
-
-								# Wir senden 'state' (für Postmulti-Logik) 
-								# UND 'status' (für Kompatibilität zur GUI) zurück
-								$c->render(json => {
-									ok     => $ok,
-									action => $cmd,
-									state  => $state,   # Dein neuer Standard
-									status => $state,   # Backup für die GUI
-									rc     => $res->{rc},
-									output => $res->{out},
-								});
-							});
-					}
-					
-					# --- 2. PRIORITÄT: Standard-Systemctl Logik ---
-					elsif ($cmd eq 'daemon-reload' || $svc eq 'systemctl') {
-						$c->render(json => $rc == 0 ? { ok => 1 } : { ok => 0, error => "Rueckgabewert=$rc" });
-					}
-					else {
-						# Default-Verhalten für andere Dienste
-						$c->render(json => {
-							ok => ($rc == 0 ? 1 : 0),
-							rc => $rc,
-							($rc != 0 ? (error => "Fehler bei $cmd") : ())
-						});
-					}
-				}	
-            })
-            ->catch(sub {
-                my ($err) = @_;
-                $log->error("Fehler bei Aktion $cmd: $err");
-                $c->render(json => { ok => 0, error => "Interner Fehler: $err" }, status => 500);
+            })->catch(sub {
+                my $err = shift;
+                $c->render(json => { ok => 0, error => "$err" }, status => 500);
             });
+            
+            return; # Wichtig, da der systemctl Zweig eigene then/catch hat
+        }
+
+        # Catch für Postmulti und Skripte (Fälle 1-3)
+        $action_promise->catch(sub {
+            my ($err) = @_;
+            $log->error("Fehler bei Aktion $cmd: $err");
+            $c->render(json => { ok => 0, error => "Interner Fehler: $err" }, status => 500);
+        }) if $action_promise;
     };
 
     # --- Raw configs ---
