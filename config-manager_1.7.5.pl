@@ -320,21 +320,15 @@ use Symbol qw(gensym);
 		$timeout = 10 unless defined $timeout && $timeout =~ /^\d+$/;
 
 		return Mojo::Promise->new(sub {
-			my ($resolve, $reject) = @_;
+			my ($resolve) = @_;
 
 			Mojo::IOLoop->subprocess(
 				sub {
-					my ($subprocess) = @_;
 					local $SIG{ALRM} = sub { die "__TIMEOUT__\n" };
 					alarm $timeout;
 
-					# WICHTIG: STDOUT und STDERR zusammenführen via Shell-Redirect
-					# Wir nutzen die Listen-Form von system für Sicherheit, 
-					# müssen aber STDOUT/ERR im Subprozess umleiten.
-					open(my $oldout, ">&STDOUT");
-					open(STDOUT, ">&STDERR"); # Leite stdout auf stderr um
-					
-					# Führe Befehl aus und fange alles ab
+					# Wir nutzen die Shell-Umleitung 2>&1, um STDOUT und STDERR 
+					# absolut sicher in einer Pipe zu fangen.
 					my $output = `@cmd 2>&1`; 
 					my $rc = ($? >> 8);
 					
@@ -343,15 +337,12 @@ use Symbol qw(gensym);
 				},
 				sub {
 					my ($subprocess, $err, $res) = @_;
-					if ($err) {
-						return $resolve->({ rc => -1, out => "Fehler: $err" });
-					}
-					$res ||= { rc => -1, out => '' };
-					return $resolve->($res);
+					$res ||= { rc => -1, out => $err // "unknown error" };
+					$resolve->($res);
 				}
 			);
 		});
-	}
+}
 
     # --- Konfigurations-Mapping ---
     our %cfgmap;
@@ -437,26 +428,23 @@ use Symbol qw(gensym);
 	sub parse_postmulti_status {
 		my ($stdout, $stderr, $rc) = @_;
 		my $txt = lc(($stdout // "") . ($stderr // ""));
-		$txt =~ s/\r//g;
-		$txt =~ s/^\s+|\s+$//g; # Whitespace entfernen
 
-		# 1. Wenn wir Text haben, ist das unser primärer Indikator
+		# Wenn "is running" ODER "pid:" vorkommt -> Dienst läuft.
 		if ($txt =~ /is\s+running/ || $txt =~ /pid:\s*\d+/) {
 			return "running";
 		}
-		if ($txt =~ /not\s+running/ || $txt =~ /inactive/) {
+
+		# Wenn "not running" ODER "inactive" vorkommt -> Dienst steht.
+		if ($txt =~ /not\s+running/ || $txt =~ /inactive/ || $txt =~ /stopped/) {
 			return "stopped";
 		}
 
-		# 2. Wenn der Output komplett leer ist, aber RC=1: 
-		# Wahrscheinlich läuft die Instanz NICHT oder der Name ist falsch.
-		if ($txt eq "") {
-			return "stopped" if $rc != 0;
-			return "unknown";
+		# Fallback auf Exit-Code (wie in deiner 1.6.1 für is-active)
+		if (defined $rc) {
+			return ($rc == 0) ? "running" : "stopped";
 		}
-
-		# 3. Fallback auf Exit-Code
-		return ($rc == 0) ? "running" : "stopped";
+		
+		return "unknown";
 	}
 
     # ==================================================
