@@ -93,7 +93,7 @@ Der **Config-Manager REST** ist eine leichtgewichtige, gehärtete Middleware fü
 
 1.  **Sichere Middleware:** Er bietet eine "kontrollierte Sandbox" für Automatisierung-Bots und CI/CD-Pipelines. Anstatt vollen Root-SSH-Zugriff zu gewähren, werden nur explizit definierte Dateien und Aktionen über eine gesicherte API freigegeben.
 2.  **Infrastructure as Code (IaC) Endpunkt:** Er fungiert als finaler programmierbarer Endpunkt für Konfigurationsänderungen und stellt sicher, dass jeder Schreibvorgang atomar erfolgt und automatisch gesichert wird.
-3.  **Resilienter Betrieb:** Durch die Integration von "Settle-Time"-Logik und anschließender Status-Verifizierung wird sichergestellt, dass Dienste nach einer Änderung nicht nur "neu gestartet" wurden, sondern tatsächlich funktionsfähig sind.
+3.  **Resilienter Betrieb:** Durch die Integration von "Settle-Time"-Logik und anschliessender Status-Verifizierung wird sichergestellt, dass Dienste nach einer Änderung nicht nur "neu gestartet" wurden, sondern tatsächlich funktionsfähig sind.
 
 ### Warum nicht einfach Ansible nutzen?
 Ansible ist ein mächtiger Orchestrator, aber oft zu träge für häufige, API-gesteuerte Konfigurations-Updates in Echtzeit. Der Config-Manager ist ein **"Always-on"-Micro-Agent**, der in Millisekunden reagiert und native Sicherheitsfeatures wie den `Path-Guard` (verhindert das Ausbrechen aus Verzeichnissen) und `Atomares Schreiben` (verhindert korrupte Dateien) bietet, die in eigenen Skripten oder generischen Tools oft fehlen.
