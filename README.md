@@ -113,41 +113,56 @@ cpanm Mojolicious
 
 ---
 
-##  API-Routen & Endpunkte
+##  API-Referenz
 
-Alle Anfragen müssen den Header `X-API-Token` oder einen Bearer-Token zur Authentifizierung enthalten.
+Alle Endpunkte erfordern die Authentifizierung via Header: `X-API-Token: <dein_token>`.
 
-### Konfigurations-Management
-
+### 1. System-Informationen
 | Methode | Route | Beschreibung |
 | :--- | :--- | :--- |
-| `GET` | `/configs` | Listet alle verwalteten Konfigurationen und verfügbaren Aktionen auf. |
-| `GET` | `/config/:name` | Lädt den aktuellen Inhalt der Konfigurationsdatei herunter. |
-| `POST` | `/config/:name` | Schreibt neuen Inhalt. Erstellt automatisch ein Backup vor dem Speichern. |
+| `GET` | `/` | Zeigt API-Name, Version und eine Liste aller verfügbaren Endpunkte. |
+| `GET` | `/health` | API-Statuscheck (Antwortet mit `{"status":"ok"}`). |
 
-### Backup & Wiederherstellung
-
+### 2. Konfigurations-Management
 | Methode | Route | Beschreibung |
 | :--- | :--- | :--- |
-| `GET` | `/backups/:name` | Listet alle verfügbaren Backups für eine spezifische Konfiguration auf. |
-| `GET` | `/backupcontent/:name/:file` | Liest den Inhalt eines spezifischen Backups aus. |
-| `POST` | `/restore/:name/:file` | Stellt eine Konfiguration aus einem Backup wieder her. |
+| `GET` | `/configs` | Listet alle registrierten Konfigurationen, Kategorien und erlaubten Aktionen auf. |
+| `GET` | `/config/*name` | Lädt den aktuellen Inhalt einer Datei herunter (`octet-stream`). |
+| `POST` | `/config/*name` | Schreibt neuen Inhalt. Erstellt automatisch ein Backup und erzwingt definierte Datei-Metadaten. |
 
-### Dienst-Steuerung (Actions)
-
+### 3. Backup & Wiederherstellung
 | Methode | Route | Beschreibung |
 | :--- | :--- | :--- |
-| `POST` | `/action/:name/:cmd` | Führt eine Aktion aus (z. B. `reload`, `restart`, `status`). |
+| `GET` | `/backups/*name` | Listet alle verfügbaren zeitgestempelten Backups für diesen Dienst auf. |
+| `GET` | `/backupcontent/*name/*file` | Zeigt den Inhalt einer spezifischen Backup-Datei an. |
+| `POST` | `/restore/*name/*file` | Stellt eine Konfiguration aus einem Backup wieder her (inkl. Rechte-Korrektur). |
 
-> **Hinweis:** Die Route `/action` unterstützt spezialisierte Logik für Systemdienste. Bei einem `reload` oder `restart` verifiziert der Agent automatisch den Status des Dienstes nach einer definierten Ruhezeit (*Settle-Time*), um sicherzustellen, dass der Dienst korrekt läuft.
-
-### System-Schnittstellen
-
+### 4. Dienst-Aktionen (Actions)
 | Methode | Route | Beschreibung |
 | :--- | :--- | :--- |
-| `GET` | `/health` | Health-Check der API (gibt `{"status": "ok"}` zurück). |
-| `GET` | `/raw/configs` | Exportiert die interne Mapping-Tabelle als rohes JSON. |
-| `POST` | `/raw/configs/reload` | Lädt die interne Konfiguration vom Dateisystem neu. |
+| `POST` | `/action/*name/*cmd` | Führt System-Kommandos aus (`reload`, `restart`, `status`, `start`, `stop`). |
+
+**Spezial-Logik in v1.7.5:**
+- **Settle-Time:** Bei `reload` wartet der Agent automatisch 0.6s, bevor der Erfolg verifiziert wird.
+- **Postmulti-Aware:** Präzises Parsen von Postfix Multi-Instanz Statusausgaben.
+- **Verifizierung:** Die API antwortet erst, wenn der tatsächliche Dienstzustand nach der Aktion bestätigt wurde.
+
+### 5. Meta-Verwaltung (Self-Management)
+| Methode | Route | Beschreibung |
+| :--- | :--- | :--- |
+| `GET` | `/raw/configs` | Exportiert die gesamte Mapping-Tabelle (`configs.json`) als JSON. |
+| `POST` | `/raw/configs` | Überschreibt die Konfigurations-Tabelle im laufenden Betrieb. |
+| `POST` | `/raw/configs/reload` | Erzwingt das neu Einlesen der `configs.json` von der Festplatte. |
+| `DELETE` | `/raw/configs/:name` | Entfernt einen Dienst-Eintrag permanent aus der API-Verwaltung. |
+
+---
+
+## Sicherheits-Architektur
+
+- **Path-Guard:** Verhindert Verzeichnis-Überschreitungen durch Pfad-Kanonisierung (`realpath`). Zugriff ist nur auf definierte `allowed_roots` möglich.
+- **IP-ACL:** Beschränkt den Zugriff auf vertrauenswürdige IP-Adressen oder CIDR-Netzwerke.
+- **Atomic Operations:** Daten werden erst in temporäre Dateien geschrieben und dann verschoben, um korrupte Zustände bei Schreibfehlern auszuschließen.
+- **Metadata Enforcement:** Stellt sicher, dass Dateien immer den korrekten Besitzer (`UID`), die Gruppe (`GID`) und die Rechte (`Mode`) besitzen, unabhängig vom Upload-Prozess.
 
 ---
 
