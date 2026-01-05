@@ -1,0 +1,1246 @@
+package main
+
+import (
+	"context"
+	"crypto/subtle"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/user"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+// --- Konfigurationsstrukturen ---
+
+type GlobalConfig struct {
+	Listen            string   `json:"listen"`
+	SSLEnable         bool     `json:"ssl_enable"`
+	SSLCertFile       string   `json:"ssl_cert_file"`
+	SSLKeyFile        string   `json:"ssl_key_file"`
+	LogFile           string   `json:"logfile"`
+	APIToken          string   `json:"api_token"`
+	AllowedIPs        []string `json:"allowed_ips"`
+	TrustedProxies    []string `json:"trusted_proxies"`
+	AllowOrigins      []string `json:"allow_origins"`
+	Systemctl         string   `json:"systemctl"`
+	SystemctlFlags    string   `json:"systemctl_flags"`
+	BackupDir         string   `json:"backupDir"`
+	TmpDir            string   `json:"tmpDir"`
+	MaxBackups        int      `json:"maxBackups"`
+	PathGuard         string   `json:"path_guard"`
+	AllowedRoots      []string `json:"allowed_roots"`
+	ApplyMeta         bool     `json:"apply_meta"`
+	AutoCreateBackups bool     `json:"auto_create_backups"`
+}
+
+type ConfigEntry struct {
+	Service     string `json:"service"`
+	Category    string `json:"category"`
+	Path        string `json:"path"`
+	User        string `json:"user"`
+	Group       string `json:"group"`
+	Mode        string `json:"mode"`
+	ApplyMeta   *bool  `json:"apply_meta"`
+	Actions     any    `json:"actions"`
+	Commands    any    `json:"commands"`
+	CommandArgs any    `json:"command_args"`
+}
+
+type CfgMapEntry struct {
+	ID        string
+	Service   string
+	Category  string
+	Path      string
+	BackupDir string
+	Actions   map[string][]string
+	Raw       ConfigEntry
+}
+
+type RouteInfo struct {
+	Method string `json:"method"`
+	Path   string `json:"path"`
+}
+
+// --- App State ---
+
+type App struct {
+	Version           string
+	GlobalPath        string
+	ConfigsPath       string
+	Global            GlobalConfig
+	CfgMap            map[string]CfgMapEntry
+	Logger            *log.Logger
+	AllowedCIDRs      []*net.IPNet
+	TrustedProxies    map[string]bool
+	AllowedRootsCanon []string
+	SystemctlBase     []string
+	AllowOriginSet    map[string]bool
+	Routes            []RouteInfo
+	mu                sync.RWMutex
+}
+
+func main() {
+	exePath, _ := os.Executable()
+	binDir := filepath.Dir(exePath)
+
+	app := &App{
+		Version:     "1.7.7-go",
+		GlobalPath:  filepath.Join(binDir, "global.json"),
+		ConfigsPath: filepath.Join(binDir, "configs.json"),
+		Logger:      log.New(os.Stderr, "", log.LstdFlags),
+	}
+
+	if err := app.init(); err != nil {
+		log.Fatalf("Kritischer Fehler beim Start: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	app.registerRoutes(mux)
+
+	server := &http.Server{
+		Addr:    app.Global.Listen,
+		Handler: app.wrapMiddlewares(mux),
+	}
+
+	app.Logger.Printf("START config-manager v%s auf %s", app.Version, app.Global.Listen)
+
+	if app.Global.SSLEnable {
+		log.Fatal(server.ListenAndServeTLS(app.Global.SSLCertFile, app.Global.SSLKeyFile))
+	} else {
+		log.Fatal(server.ListenAndServe())
+	}
+}
+
+// --- Initialisierung & Config ---
+
+func (a *App) init() error {
+	data, err := os.ReadFile(a.GlobalPath)
+	if err != nil {
+		return fmt.Errorf("global.json nicht gefunden: %w", err)
+	}
+	if err := json.Unmarshal(data, &a.Global); err != nil {
+		return fmt.Errorf("global.json ungueltig: %w", err)
+	}
+
+	// Logging
+	logFile := a.Global.LogFile
+	if logFile == "" {
+		logFile = "/var/log/config-manager.log"
+	}
+	_ = os.MkdirAll(filepath.Dir(logFile), 0755)
+	if f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640); err == nil {
+		a.Logger = log.New(f, "", log.LstdFlags)
+	}
+
+	// Systemctl Flags
+	sBin := a.Global.Systemctl
+	if sBin == "" {
+		sBin = "/usr/bin/systemctl"
+	}
+	a.SystemctlBase = []string{sBin}
+	if flags := os.Getenv("SYSTEMCTL_FLAGS"); flags != "" {
+		a.SystemctlBase = append(a.SystemctlBase, strings.Fields(flags)...)
+	} else if a.Global.SystemctlFlags != "" {
+		a.SystemctlBase = append(a.SystemctlBase, strings.Fields(a.Global.SystemctlFlags)...)
+	}
+
+	// IP Filter
+	for _, cidr := range a.Global.AllowedIPs {
+		_, n, err := net.ParseCIDR(cidr)
+		if err == nil {
+			a.AllowedCIDRs = append(a.AllowedCIDRs, n)
+		}
+	}
+
+	a.TrustedProxies = make(map[string]bool)
+	for _, ip := range a.Global.TrustedProxies {
+		a.TrustedProxies[ip] = true
+	}
+
+	// Allow origins set
+	a.AllowOriginSet = make(map[string]bool)
+	for _, o := range a.Global.AllowOrigins {
+		if strings.TrimSpace(o) != "" {
+			a.AllowOriginSet[o] = true
+		}
+	}
+
+	// Path Guard canonical roots
+	for _, r := range a.Global.AllowedRoots {
+		if abs, err := filepath.Abs(r); err == nil {
+			abs = strings.TrimSuffix(abs, string(os.PathSeparator)) + string(os.PathSeparator)
+			a.AllowedRootsCanon = append(a.AllowedRootsCanon, abs)
+		}
+	}
+
+	// Defaults
+	if a.Global.MaxBackups <= 0 {
+		a.Global.MaxBackups = 10
+	}
+	if a.Global.PathGuard == "" {
+		a.Global.PathGuard = "off"
+	}
+
+	// Backup/Tmp dirs vorhanden oder erstellbar
+	backupRoot := a.Global.BackupDir
+	if backupRoot == "" {
+		backupRoot = "./backup"
+	}
+	tmpRoot := a.Global.TmpDir
+	if tmpRoot == "" {
+		tmpRoot = "./tmp"
+	}
+	if err := os.MkdirAll(backupRoot, 0750); err != nil {
+		return fmt.Errorf("backup dir nicht erstellbar: %w", err)
+	}
+	if err := os.MkdirAll(tmpRoot, 0750); err != nil {
+		return fmt.Errorf("tmp dir nicht erstellbar: %w", err)
+	}
+
+	return a.reloadConfigs()
+}
+
+func (a *App) reloadConfigs() error {
+	data, err := os.ReadFile(a.ConfigsPath)
+	if err != nil {
+		return err
+	}
+	var raw map[string]ConfigEntry
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	backupRoot := a.Global.BackupDir
+	if backupRoot == "" {
+		backupRoot = "./backup"
+	}
+
+	newMap := make(map[string]CfgMapEntry)
+	for name, entry := range raw {
+		if badName(name) {
+			continue
+		}
+		svc := entry.Service
+		if svc == "" {
+			svc = name
+		}
+		newMap[name] = CfgMapEntry{
+			ID:        name,
+			Service:   svc,
+			Category:  defStr(entry.Category, "uncategorized"),
+			Path:      entry.Path,
+			BackupDir: filepath.Join(backupRoot, sanitizeFilename(name)),
+			Actions:   deriveActions(entry),
+			Raw:       entry,
+		}
+	}
+
+	a.mu.Lock()
+	a.CfgMap = newMap
+	a.mu.Unlock()
+	return nil
+}
+
+// --- Middlewares (Auth, IP, Logging) ---
+
+func (a *App) wrapMiddlewares(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		reqID := fmt.Sprintf("%x", start.UnixNano())
+		ip := a.getClientIP(r)
+
+		// CORS allowlist wenn konfiguriert, sonst Origin spiegeln
+		origin := r.Header.Get("Origin")
+		if len(a.AllowOriginSet) > 0 {
+			if a.AllowOriginSet[origin] {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+			} else {
+				w.Header().Set("Access-Control-Allow-Origin", "null")
+			}
+		} else {
+			if origin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+			} else {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			}
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Token, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		// IP Check
+		if len(a.AllowedCIDRs) > 0 {
+			userIP := net.ParseIP(ip)
+			allowed := false
+			for _, n := range a.AllowedCIDRs {
+				if n.Contains(userIP) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				a.Logger.Printf("[%s] FORBIDDEN IP: %s", reqID, ip)
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+		}
+
+		// Token Auth
+		token := r.Header.Get("X-API-Token")
+		if token == "" {
+			if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+				token = auth[7:]
+			}
+		}
+		expected := a.Global.APIToken
+		if envToken := os.Getenv("API_TOKEN"); envToken != "" {
+			expected = envToken
+		}
+		if expected != "" && subtle.ConstantTimeCompare([]byte(token), []byte(expected)) != 1 {
+			a.Logger.Printf("[%s] UNAUTHORIZED from %s", reqID, ip)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		a.Logger.Printf("[%s] %s %s from %s", reqID, r.Method, r.URL.Path, ip)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- API Router & Handlers ---
+
+func (a *App) addRoute(method, path string) {
+	a.Routes = append(a.Routes, RouteInfo{Method: method, Path: path})
+}
+
+func (a *App) registerRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/", a.handleIndex)
+	a.addRoute("GET", "/")
+
+	mux.HandleFunc("/configs", a.handleListConfigs)
+	a.addRoute("GET", "/configs")
+
+	mux.HandleFunc("/config/", a.handleConfig)
+	a.addRoute("GET", "/config/<name>")
+	a.addRoute("POST", "/config/<name>")
+
+	mux.HandleFunc("/backups/", a.handleBackups)
+	a.addRoute("GET", "/backups/<name>")
+
+	mux.HandleFunc("/backupcontent/", a.handleBackupContent)
+	a.addRoute("GET", "/backupcontent/<name>/<filename>")
+
+	mux.HandleFunc("/restore/", a.handleRestore)
+	a.addRoute("POST", "/restore/<name>/<filename>")
+
+	mux.HandleFunc("/action/", a.handleAction)
+	a.addRoute("POST", "/action/<name>/<cmd>")
+
+	mux.HandleFunc("/raw/configs", a.handleRawConfigs)
+	a.addRoute("GET", "/raw/configs")
+	a.addRoute("POST", "/raw/configs")
+
+	mux.HandleFunc("/raw/configs/reload", a.handleRawReload)
+	a.addRoute("POST", "/raw/configs/reload")
+
+	mux.HandleFunc("/raw/configs/", a.handleRawDelete) // DELETE /raw/configs/:name
+	a.addRoute("DELETE", "/raw/configs/<name>")
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		jsonResp(w, 200, map[string]any{"ok": 1, "status": "ok"})
+	})
+	a.addRoute("GET", "/health")
+}
+
+func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.Error(w, "Not Found", 404)
+		return
+	}
+
+	routes := make([]RouteInfo, 0, len(a.Routes))
+	routes = append(routes, a.Routes...)
+	sort.Slice(routes, func(i, j int) bool {
+		if routes[i].Path == routes[j].Path {
+			return routes[i].Method < routes[j].Method
+		}
+		return routes[i].Path < routes[j].Path
+	})
+
+	jsonResp(w, 200, map[string]any{
+		"ok":            1,
+		"name":          "config-manager",
+		"version":       a.Version,
+		"api_endpoints": routes,
+	})
+}
+
+func (a *App) handleListConfigs(w http.ResponseWriter, r *http.Request) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	var list []map[string]any
+	for _, e := range a.CfgMap {
+		var acts []string
+		for k := range e.Actions {
+			acts = append(acts, k)
+		}
+		sort.Strings(acts)
+		list = append(list, map[string]any{
+			"id":       e.ID,
+			"filename": filepath.Base(e.Path),
+			"filetype": strings.TrimPrefix(filepath.Ext(e.Path), "."),
+			"category": e.Category,
+			"actions":  acts,
+		})
+	}
+
+	sort.Slice(list, func(i, j int) bool {
+		return fmt.Sprint(list[i]["id"]) < fmt.Sprint(list[j]["id"])
+	})
+
+	jsonResp(w, 200, map[string]any{"ok": 1, "configs": list})
+}
+
+func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/config/")
+	if badName(name) {
+		http.Error(w, "Bad Request", 400)
+		return
+	}
+
+	a.mu.RLock()
+	e, ok := a.CfgMap[name]
+	a.mu.RUnlock()
+
+	if !ok {
+		http.Error(w, "Config not found", 404)
+		return
+	}
+	if !a.isAllowedPath(e.Path) {
+		http.Error(w, "Path guard violation", 400)
+		return
+	}
+
+	if r.Method == "GET" {
+		data, err := os.ReadFile(e.Path)
+		if err != nil {
+			http.Error(w, "Read error", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(data)
+		return
+	}
+
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+
+	// Content exakt wie Perl Logik
+	// 1) Body immer als rohe Bytes lesen
+	// 2) Wenn JSON Content-Type und {"content": "..."} vorhanden dann diesen String nehmen
+	// 3) Sonst bleiben die rohen Bytes wie sie kamen
+	rawBody, _ := io.ReadAll(r.Body)
+	content := rawBody
+
+	if strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+		var m map[string]any
+		if err := json.Unmarshal(rawBody, &m); err == nil {
+			if v, ok := m["content"]; ok {
+				if s, ok := v.(string); ok {
+					content = []byte(s)
+				}
+			}
+		}
+	}
+
+	// Backup-Verzeichnis
+	if err := os.MkdirAll(e.BackupDir, 0750); err != nil {
+		if !a.Global.AutoCreateBackups {
+			jsonResp(w, 500, map[string]any{"ok": 0, "error": "Backup-Verzeichnis fehlt"})
+			return
+		}
+		jsonResp(w, 500, map[string]any{"ok": 0, "error": "Backup-Verzeichnis nicht erstellbar"})
+		return
+	}
+
+	// Backup wenn Ziel existiert
+	if _, err := os.Stat(e.Path); err == nil {
+		ts := time.Now().Format("20060102_150405")
+		bFile := filepath.Join(e.BackupDir, filepath.Base(e.Path)+".bak."+ts)
+		_ = copyFile(e.Path, bFile)
+		a.rotateBackups(e.BackupDir, filepath.Base(e.Path))
+	}
+
+	method := "atomic"
+	if err := a.writeAtomic(e.Path, content); err != nil {
+		// Fallback wie Perl
+		method = "plain"
+		if err2 := os.WriteFile(e.Path, content, 0640); err2 != nil {
+			jsonResp(w, 500, map[string]any{"ok": 0, "error": err2.Error()})
+			return
+		}
+	}
+
+	metaWanted := a.metaWanted(e.Raw)
+	appliedErr := a.applyMeta(e.Raw, e.Path)
+	if appliedErr != nil {
+		a.Logger.Printf("WARN apply_meta failed for %s: %v", e.Path, appliedErr)
+	}
+
+	appliedMode := modeStr(e.Path)
+	uid, gid := fileUIDGID(e.Path)
+
+	jsonResp(w, 200, map[string]any{
+		"ok":     1,
+		"saved":  name,
+		"path":   e.Path,
+		"method": method,
+		"requested": map[string]any{
+			"user":       e.Raw.User,
+			"group":      e.Raw.Group,
+			"mode":       e.Raw.Mode,
+			"apply_meta": metaWanted,
+		},
+		"applied": map[string]any{
+			"uid":  uid,
+			"gid":  gid,
+			"mode": appliedMode,
+		},
+	})
+}
+
+func (a *App) handleAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/action/"), "/")
+	if len(parts) < 2 {
+		http.Error(w, "Bad Request", 400)
+		return
+	}
+	name, action := parts[0], parts[1]
+	if badName(name) {
+		http.Error(w, "Bad Request", 400)
+		return
+	}
+
+	a.mu.RLock()
+	e, ok := a.CfgMap[name]
+	a.mu.RUnlock()
+
+	if !ok {
+		http.Error(w, "Not found", 404)
+		return
+	}
+
+	cmdArgs, allowed := e.Actions[action]
+	if !allowed {
+		http.Error(w, "Action not allowed", 400)
+		return
+	}
+	if err := validateArgs(cmdArgs); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+
+	svc := e.Service
+
+	// postmulti Sonderfall
+	if bin, isPM := isPostmultiService(svc); isPM {
+		a.handlePostmultiAction(w, ctx, name, action, bin, cmdArgs, e.Actions)
+		return
+	}
+
+	// Script-Runner oder systemctl
+	if strings.HasPrefix(svc, "bash:") || strings.HasPrefix(svc, "sh:") || strings.HasPrefix(svc, "perl:") || strings.HasPrefix(svc, "exec:") {
+		sParts := strings.SplitN(svc, ":", 2)
+		runner, script := sParts[0], sParts[1]
+
+		// Schutz wie Perl: exec systemctl Subcommands blocken
+		if runner == "exec" && strings.HasSuffix(script, "/systemctl") {
+			if len(cmdArgs) > 0 {
+				switch cmdArgs[0] {
+				case "poweroff", "reboot", "halt":
+					http.Error(w, "Subcommand verboten", 400)
+					return
+				}
+			}
+		}
+
+		var argv []string
+		switch runner {
+		case "bash":
+			argv = append([]string{"/bin/bash", script}, cmdArgs...)
+		case "sh":
+			argv = append([]string{"/bin/sh", script}, cmdArgs...)
+		case "perl":
+			argv = append([]string{"/usr/bin/perl", script}, cmdArgs...)
+		default:
+			argv = append([]string{script}, cmdArgs...)
+		}
+
+		rc, out := runCmdCombined(ctx, argv[0], argv[1:]...)
+
+		// Sonderlogik wie Perl: is-active
+		if len(cmdArgs) > 0 && cmdArgs[0] == "is-active" {
+			jsonResp(w, 200, map[string]any{
+				"ok":     1,
+				"status": tern(rc == 0, "running", "stopped"),
+				"rc":     rc,
+			})
+			return
+		}
+
+		jsonResp(w, 200, map[string]any{
+			"ok":     ternBool(rc == 0),
+			"rc":     rc,
+			"output": out,
+			"action": action,
+		})
+		return
+	}
+
+	// systemctl services
+	base := a.SystemctlBase
+
+	// reload nur wenn aktiv
+	if action == "reload" {
+		rcActive, _ := runCmdCombined(ctx, base[0], append(base[1:], "is-active", svc)...)
+		if rcActive != 0 {
+			jsonResp(w, 500, map[string]any{"ok": 0, "error": "Dienst nicht aktiv"})
+			return
+		}
+		rc, out := runCmdCombined(ctx, base[0], append(base[1:], "reload", svc)...)
+
+		rc2, _ := runCmdCombined(ctx, base[0], append(base[1:], "is-active", svc)...)
+		state := tern(rc2 == 0, "running", "stopped")
+		jsonResp(w, 200, map[string]any{
+			"ok":     ternBool(state == "running"),
+			"action": action,
+			"status": state,
+			"rc":     rc,
+			"output": out,
+		})
+		return
+	}
+
+	// stop_start fix
+	if action == "stop_start" {
+		_, _ = runCmdCombined(ctx, base[0], append(base[1:], "stop", svc)...)
+		rc, out := runCmdCombined(ctx, base[0], append(base[1:], "start", svc)...)
+
+		rc2, _ := runCmdCombined(ctx, base[0], append(base[1:], "is-active", svc)...)
+		state := tern(rc2 == 0, "running", "stopped")
+		ok2 := (state == "running")
+
+		jsonResp(w, 200, map[string]any{
+			"ok":     ternBool(ok2),
+			"action": action,
+			"status": state,
+			"rc":     rc,
+			"output": out,
+		})
+		return
+	}
+
+	rc, out := runCmdCombined(ctx, base[0], append(base[1:], action, svc)...)
+
+	// Nachlauf-Status fuer start stop restart
+	if action == "start" || action == "stop" || action == "restart" {
+		rc2, _ := runCmdCombined(ctx, base[0], append(base[1:], "is-active", svc)...)
+		state := tern(rc2 == 0, "running", "stopped")
+		ok2 := (state == "running")
+		if action == "stop" {
+			ok2 = (state == "stopped")
+		}
+		jsonResp(w, 200, map[string]any{
+			"ok":     ternBool(ok2),
+			"action": action,
+			"status": state,
+			"rc":     rc,
+			"output": out,
+		})
+		return
+	}
+
+	jsonResp(w, 200, map[string]any{
+		"ok":     ternBool(rc == 0),
+		"rc":     rc,
+		"output": out,
+		"action": action,
+	})
+}
+
+func (a *App) handlePostmultiAction(w http.ResponseWriter, ctx context.Context, name, action, bin string, cmdArgs []string, actmap map[string][]string) {
+	rc, out := runCmdCombined(ctx, bin, cmdArgs...)
+
+	if action == "stop" || action == "start" || action == "reload" || action == "restart" {
+		time.Sleep(600 * time.Millisecond)
+	}
+
+	statusArgs := actmap["status"]
+	if len(statusArgs) == 0 {
+		statusArgs = []string{"-i", name, "-p", "status"}
+	}
+
+	rcS, outS := runCmdCombined(ctx, bin, statusArgs...)
+	state := parsePostmultiStatus(outS, "", rcS)
+
+	ok := false
+	if action == "stop" {
+		ok = (state == "stopped")
+	} else if action == "status" {
+		ok = true
+	} else {
+		ok = (state == "running")
+	}
+
+	jsonResp(w, 200, map[string]any{
+		"ok":     ternBool(ok),
+		"action": action,
+		"status": state,
+		"rc":     rc,
+		"output": out,
+	})
+}
+
+// --- Backups, Raw Config etc ---
+
+func (a *App) handleBackups(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/backups/")
+	if badName(name) {
+		http.Error(w, "Bad request", 400)
+		return
+	}
+
+	a.mu.RLock()
+	e, ok := a.CfgMap[name]
+	a.mu.RUnlock()
+	if !ok {
+		http.Error(w, "Not found", 404)
+		return
+	}
+
+	files, _ := filepath.Glob(filepath.Join(e.BackupDir, filepath.Base(e.Path)+".bak.*"))
+	res := []string{}
+	for _, f := range files {
+		res = append(res, filepath.Base(f))
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(res)))
+	jsonResp(w, 200, map[string]any{"ok": 1, "backups": res})
+}
+
+func (a *App) handleBackupContent(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/backupcontent/"), "/")
+	if len(parts) < 2 {
+		http.Error(w, "Bad request", 400)
+		return
+	}
+	name, file := parts[0], parts[1]
+	if badName(name) || badName(file) {
+		http.Error(w, "Bad request", 400)
+		return
+	}
+
+	a.mu.RLock()
+	e, ok := a.CfgMap[name]
+	a.mu.RUnlock()
+	if !ok {
+		http.Error(w, "Not found", 404)
+		return
+	}
+
+	data, err := os.ReadFile(filepath.Join(e.BackupDir, file))
+	if err != nil {
+		http.Error(w, "File not found", 404)
+		return
+	}
+	jsonResp(w, 200, map[string]any{"ok": 1, "content": string(data)})
+}
+
+func (a *App) handleRestore(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/restore/"), "/")
+	if len(parts) < 2 {
+		http.Error(w, "Bad request", 400)
+		return
+	}
+	name, file := parts[0], parts[1]
+	if badName(name) || badName(file) {
+		http.Error(w, "Bad request", 400)
+		return
+	}
+
+	a.mu.RLock()
+	e, ok := a.CfgMap[name]
+	a.mu.RUnlock()
+	if !ok {
+		http.Error(w, "Not found", 404)
+		return
+	}
+
+	src := filepath.Join(e.BackupDir, file)
+	if err := copyFile(src, e.Path); err != nil {
+		jsonResp(w, 500, map[string]any{"ok": 0, "error": err.Error()})
+		return
+	}
+
+	if err := a.applyMeta(e.Raw, e.Path); err != nil {
+		a.Logger.Printf("WARN apply_meta restore failed for %s: %v", e.Path, err)
+	}
+
+	appliedMode := modeStr(e.Path)
+	uid, gid := fileUIDGID(e.Path)
+
+	jsonResp(w, 200, map[string]any{
+		"ok":       1,
+		"restored": name,
+		"applied":  map[string]any{"uid": uid, "gid": gid, "mode": appliedMode},
+	})
+}
+
+func (a *App) handleRawConfigs(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		data, _ := os.ReadFile(a.ConfigsPath)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(data)
+		return
+
+	case "POST":
+		data, _ := io.ReadAll(r.Body)
+		var tmp map[string]ConfigEntry
+		if err := json.Unmarshal(data, &tmp); err != nil {
+			jsonResp(w, 400, map[string]any{"ok": 0, "error": "Invalid JSON"})
+			return
+		}
+
+		if err := a.writeAtomic(a.ConfigsPath, data); err != nil {
+			jsonResp(w, 500, map[string]any{"ok": 0, "error": err.Error()})
+			return
+		}
+
+		_ = a.reloadConfigs()
+		jsonResp(w, 200, map[string]any{"ok": 1, "reload": 1})
+		return
+
+	default:
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+}
+
+func (a *App) handleRawReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	if err := a.reloadConfigs(); err != nil {
+		jsonResp(w, 500, map[string]any{"ok": 0, "error": err.Error()})
+		return
+	}
+	jsonResp(w, 200, map[string]any{"ok": 1, "reloaded": 1})
+}
+
+func (a *App) handleRawDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "DELETE" {
+		return
+	}
+
+	name := strings.TrimPrefix(r.URL.Path, "/raw/configs/")
+	if badName(name) {
+		jsonResp(w, 400, map[string]any{"ok": 0, "error": "Ungueltiger Name"})
+		return
+	}
+
+	rawBytes, err := os.ReadFile(a.ConfigsPath)
+	if err != nil {
+		jsonResp(w, 500, map[string]any{"ok": 0})
+		return
+	}
+
+	var cfg map[string]ConfigEntry
+	if err := json.Unmarshal(rawBytes, &cfg); err != nil {
+		jsonResp(w, 500, map[string]any{"ok": 0})
+		return
+	}
+
+	if _, ok := cfg[name]; !ok {
+		jsonResp(w, 404, map[string]any{"ok": 0})
+		return
+	}
+	delete(cfg, name)
+
+	outBytes, _ := json.Marshal(cfg)
+	if err := a.writeAtomic(a.ConfigsPath, outBytes); err != nil {
+		jsonResp(w, 500, map[string]any{"ok": 0, "error": err.Error()})
+		return
+	}
+
+	_ = a.reloadConfigs()
+	jsonResp(w, 200, map[string]any{"ok": 1})
+}
+
+// --- Hilfsfunktionen (System & Files) ---
+
+func (a *App) isAllowedPath(p string) bool {
+	if strings.ToLower(a.Global.PathGuard) == "off" {
+		return true
+	}
+
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return false
+	}
+
+	if fi, err := os.Lstat(p); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+
+	if len(a.AllowedRootsCanon) == 0 {
+		return strings.ToLower(a.Global.PathGuard) == "audit"
+	}
+
+	absWithSep := abs
+	if !strings.HasSuffix(absWithSep, string(os.PathSeparator)) {
+		absWithSep += string(os.PathSeparator)
+	}
+
+	for _, root := range a.AllowedRootsCanon {
+		if strings.HasPrefix(absWithSep, root) {
+			return true
+		}
+	}
+
+	return strings.ToLower(a.Global.PathGuard) == "audit"
+}
+
+func (a *App) writeAtomic(p string, data []byte) error {
+	dir := filepath.Dir(p)
+	base := filepath.Base(p)
+	tmp := filepath.Join(dir, ".tmp_"+base+"."+strconv.FormatInt(time.Now().UnixNano(), 10))
+	if err := os.WriteFile(tmp, data, 0640); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p)
+}
+
+func (a *App) metaWanted(e ConfigEntry) bool {
+	autoWanted := (e.User != "" || e.Group != "" || e.Mode != "")
+	if e.ApplyMeta != nil {
+		return *e.ApplyMeta
+	}
+	return a.Global.ApplyMeta || autoWanted
+}
+
+var (
+	modeRe    = regexp.MustCompile(`^[0-7]{3,4}$`)
+	rePMpid   = regexp.MustCompile(`pid:\s*\d+`)
+	rePMrun   = regexp.MustCompile(`[\w\-\.\/]+:\s*(the\s+postfix\s+mail\s+system\s+is\s+)?running`)
+	rePMstop  = regexp.MustCompile(`[\w\-\.\/]+:\s*not\s+running`)
+	safeArgRe = regexp.MustCompile(`^[A-Za-z0-9._:+@/=\-,]+$`)
+)
+
+func (a *App) applyMeta(e ConfigEntry, p string) error {
+	if !a.metaWanted(e) {
+		return nil
+	}
+	if !a.isAllowedPath(p) {
+		return fmt.Errorf("pfad nicht erlaubt")
+	}
+	if fi, err := os.Lstat(p); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("symlink abgelehnt")
+	}
+
+	uid, gid := -1, -1
+
+	if e.User != "" {
+		u, err := user.Lookup(e.User)
+		if err != nil {
+			return fmt.Errorf("user lookup fehlgeschlagen: %w", err)
+		}
+		uid, _ = strconv.Atoi(u.Uid)
+	}
+
+	if e.Group != "" {
+		g, err := user.LookupGroup(e.Group)
+		if err != nil {
+			return fmt.Errorf("group lookup fehlgeschlagen: %w", err)
+		}
+		gid, _ = strconv.Atoi(g.Gid)
+	}
+
+	if uid != -1 || gid != -1 {
+		if err := os.Chown(p, uid, gid); err != nil {
+			return fmt.Errorf("chown fehlgeschlagen: %w", err)
+		}
+	}
+
+	if e.Mode != "" {
+		mStr := strings.TrimLeft(e.Mode, "0")
+		if mStr == "" {
+			mStr = "0"
+		}
+		if !modeRe.MatchString(mStr) {
+			return fmt.Errorf("ungueltiger modus: %q", e.Mode)
+		}
+		m, _ := strconv.ParseUint(mStr, 8, 32)
+		if err := os.Chmod(p, os.FileMode(m)); err != nil {
+			return fmt.Errorf("chmod fehlgeschlagen: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (a *App) rotateBackups(dir, base string) {
+	files, _ := filepath.Glob(filepath.Join(dir, base+".bak.*"))
+	if len(files) <= a.Global.MaxBackups {
+		return
+	}
+	sort.Strings(files)
+	for i := 0; i < len(files)-a.Global.MaxBackups; i++ {
+		_ = os.Remove(files[i])
+	}
+}
+
+func (a *App) getClientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if a.TrustedProxies[host] {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			return strings.TrimSpace(strings.Split(xff, ",")[0])
+		}
+	}
+	return host
+}
+
+// --- derive actions ---
+
+func deriveActions(e ConfigEntry) map[string][]string {
+	res := make(map[string][]string)
+
+	if m, ok := e.Actions.(map[string]any); ok {
+		for k, v := range m {
+			res[k] = anyToStringSlice(v)
+		}
+		return res
+	}
+
+	if m, ok := e.Commands.(map[string]any); ok {
+		for k, v := range m {
+			res[k] = anyToStringSlice(v)
+		}
+		return res
+	}
+
+	if m, ok := e.CommandArgs.(map[string]any); ok {
+		tokens := []string{}
+		if arr, ok := e.Commands.([]any); ok {
+			for _, x := range arr {
+				tokens = append(tokens, fmt.Sprint(x))
+			}
+		} else {
+			for k := range m {
+				tokens = append(tokens, k)
+			}
+		}
+		for _, t := range tokens {
+			if v, ok := m[t]; ok {
+				res[t] = anyToStringSlice(v)
+			}
+		}
+		return res
+	}
+
+	if arr, ok := e.Commands.([]any); ok {
+		for _, x := range arr {
+			if fmt.Sprint(x) == "run" {
+				res["run"] = []string{}
+			}
+		}
+	}
+
+	return res
+}
+
+func anyToStringSlice(v any) []string {
+	out := []string{}
+	if sl, ok := v.([]any); ok {
+		for _, arg := range sl {
+			out = append(out, fmt.Sprint(arg))
+		}
+		return out
+	}
+	if sl, ok := v.([]string); ok {
+		return append(out, sl...)
+	}
+	return out
+}
+
+// --- postmulti ---
+
+func parsePostmultiStatus(stdout, stderr string, rc int) string {
+	txt := strings.ToLower((stdout + stderr))
+	txt = strings.ReplaceAll(txt, "\r", "")
+
+	if strings.Contains(txt, "is running") || rePMpid.MatchString(txt) || rePMrun.MatchString(txt) {
+		return "running"
+	}
+
+	if strings.Contains(txt, "not running") || strings.Contains(txt, "inactive") || strings.Contains(txt, "stopped") || rePMstop.MatchString(txt) {
+		return "stopped"
+	}
+
+	if rc == 0 {
+		return "running"
+	}
+	if rc == 1 {
+		return "stopped"
+	}
+	return "unknown"
+}
+
+func isPostmultiService(svc string) (string, bool) {
+	if svc == "exec:/usr/sbin/postmulti" || strings.HasPrefix(svc, "exec:/usr/sbin/postmulti") {
+		return "/usr/sbin/postmulti", true
+	}
+	return "", false
+}
+
+// --- validation ---
+
+func validateArgs(args []string) error {
+	for _, a := range args {
+		if !safeArgRe.MatchString(a) {
+			return fmt.Errorf("ungueltiges Argument: %q", a)
+		}
+	}
+	return nil
+}
+
+// --- Util ---
+
+func jsonResp(w http.ResponseWriter, code int, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+func sanitizeFilename(s string) string {
+	return regexp.MustCompile(`[^A-Za-z0-9._-]+`).ReplaceAllString(s, "_")
+}
+
+func copyFile(src, dst string) error {
+	source, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+
+	destination, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destination.Close()
+
+	_, err = io.Copy(destination, source)
+	return err
+}
+
+func runCmdCombined(ctx context.Context, bin string, args ...string) (int, string) {
+	cmd := exec.CommandContext(ctx, bin, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			return exitError.ExitCode(), string(out)
+		}
+		return -1, string(out)
+	}
+	return 0, string(out)
+}
+
+func badName(s string) bool {
+	if s == "" {
+		return true
+	}
+	if strings.ContainsAny(s, "/\\") {
+		return true
+	}
+	if strings.Contains(s, "..") {
+		return true
+	}
+	return false
+}
+
+func defStr(s, d string) string {
+	if strings.TrimSpace(s) == "" {
+		return d
+	}
+	return s
+}
+
+func tern(cond bool, a, b string) string {
+	if cond {
+		return a
+	}
+	return b
+}
+
+func ternBool(cond bool) int {
+	if cond {
+		return 1
+	}
+	return 0
+}
+
+func modeStr(p string) string {
+	fi, err := os.Stat(p)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%04o", fi.Mode().Perm())
+}
+
+func fileUIDGID(p string) (int, int) {
+	fi, err := os.Stat(p)
+	if err != nil {
+		return -1, -1
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return -1, -1
+	}
+	return int(st.Uid), int(st.Gid)
+}
