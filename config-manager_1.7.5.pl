@@ -663,9 +663,16 @@ use Symbol qw(gensym);
         my $e = $cfgmap{$name} or return $c->render(json => { ok => 0, error => "Unbekannte Konfiguration: $name" }, status => 404);
 
         my $bdir = $e->{backup_dir};
-        return $c->render(json => { ok => 0, error => "Backup-Verzeichnis fehlt: $bdir" }, status => 500) unless -d $bdir;
+        
+        # FIX: Wenn das Verzeichnis fehlt, geben wir einfach eine leere Liste zurück statt 500
+        unless (-d $bdir) {
+            return $c->render(json => { ok => 1, backups => [] });
+        }
 
-        my $base = path($e->{path})->basename;
+        # Sicherheitscheck: Falls 'path' in der configs.json fehlt
+        my $conf_path = $e->{path} // return $c->render(json => { ok => 0, error => "Konfig-Pfad nicht definiert" }, status => 500);
+
+        my $base = path($conf_path)->basename;
         my @files = sort { $b cmp $a } grep { defined } glob("$bdir/$base.bak.*");
         @files = map { s{^\Q$bdir\E/}{}r } @files;
 
@@ -952,7 +959,7 @@ use Symbol qw(gensym);
     # ---------------- Hooks ----------------
     app->hook(before_dispatch => sub {
         my $c = shift;
-        $c->stash(req_id => sprintf('%x-%x', int(time() * 1000), $$));
+        $c->stash(req_id => sprintf('%x-%x-%04x', int(time() * 1000), $$, rand(0xffff)));
         $c->stash(t0     => steady_time());
         $c->stash(client_ip => _client_ip($c));
 
