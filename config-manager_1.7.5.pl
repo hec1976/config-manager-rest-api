@@ -652,32 +652,27 @@ use Symbol qw(gensym);
     };
 
     # --- Backups auflisten ---
-    get '/backups/*name' => sub {
-        my $c = shift;
-        my $name = $c->stash('name');
 
-        if ($name =~ m{[/\\]}) {
-            return $c->render(json => { ok => 0, error => 'Ungueltiger Name' }, status => 400);
-        }
+	get '/backups/*name' => sub {
+		my $c = shift;
+		my $name = $c->stash('name');
+		if ($name =~ m{[/\\]}) {
+			return $c->render(json => { ok => 0, error => 'Ungueltiger Name' }, status => 400);
+		}
+		my $e = $cfgmap{$name} or return $c->render(json => { ok => 0, error => "Unbekannte Konfiguration: $name" }, status => 404);
+		my $bdir = $e->{backup_dir};
 
-        my $e = $cfgmap{$name} or return $c->render(json => { ok => 0, error => "Unbekannte Konfiguration: $name" }, status => 404);
+		# HIER WAR DER FEHLER (Status 500 bei neuem Dienst)
+		# ÄNDERE DIESE ZEILE:
+		unless (-d $bdir) {
+			return $c->render(json => { ok => 1, backups => [] });
+		}
 
-        my $bdir = $e->{backup_dir};
-        
-        # FIX: Wenn das Verzeichnis fehlt, geben wir einfach eine leere Liste zurück statt 500
-        unless (-d $bdir) {
-            return $c->render(json => { ok => 1, backups => [] });
-        }
-
-        # Sicherheitscheck: Falls 'path' in der configs.json fehlt
-        my $conf_path = $e->{path} // return $c->render(json => { ok => 0, error => "Konfig-Pfad nicht definiert" }, status => 500);
-
-        my $base = path($conf_path)->basename;
-        my @files = sort { $b cmp $a } grep { defined } glob("$bdir/$base.bak.*");
-        @files = map { s{^\Q$bdir\E/}{}r } @files;
-
-        $c->render(json => { ok => 1, backups => \@files });
-    };
+		my $base = path($e->{path})->basename;
+		my @files = sort { $b cmp $a } grep { defined } glob("$bdir/$base.bak.*");
+		@files = map { s{^\Q$bdir\E/}{}r } @files;
+		$c->render(json => { ok => 1, backups => \@files });
+	};
 
     # --- Backup-Inhalt lesen ---
     get '/backupcontent/*name/*filename' => sub {
