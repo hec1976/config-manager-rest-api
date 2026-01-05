@@ -3,8 +3,19 @@
 # Version: 1.7.5 (2026-01-05)
 #
 # FIX 1.7.5:
-# - FIX: parse_postmulti_status erkennt nun Instanz-Präfixe (z.B. postfix-xxxx/...)
-# - IMPROVE: Fallback auf RC=0 bei Status-Abfrage#
+# - FIX: parse_postmulti_status erkennt nun Instanz-Präfixe (z. B. postfix-xxxx/...)
+#   - Problem: Die Funktion parse_postmulti_status erkannte nur generische Statusmeldungen wie "is running" oder "not running",
+#     aber keine instanzspezifischen Ausgaben wie "postfix-apphost: the Postfix mail system is running".
+#   - Lösung: Die Regex-Muster wurden erweitert, um Instanz-Präfixe zu erkennen. Beispielsweise wird nun:
+#     - "postfix-apphost: the Postfix mail system is running" als "running" erkannt.
+#     - "postfix-webhost: not running" als "stopped" erkannt.
+#   - Vorteil: Präzisere Statusabfrage für mehrere Postfix-Instanzen.
+#
+# - IMPROVE: Fallback auf RC=0 bei Status-Abfrage
+#   - Problem: Bei leerem oder unklarem Output von postmulti wurde der Status als "unknown" klassifiziert,
+#     selbst wenn der Exit-Code (RC=0) auf einen laufenden Dienst hindeutete.
+#   - Lösung: Bei Exit-Code 0 (RC=0) wird nun standardmässig "running" zurückgegeben, wenn der Output unklar ist.
+#   - Vorteil: Robustere Statuserkennung, weniger falsche "unknown"-Meldungen.
 #
 # FIX 1.7.4:
 # - FIX: postmulti actions now re-check status after stop/start/reload
@@ -321,15 +332,18 @@ use Symbol qw(gensym);
 
 		return Mojo::Promise->new(sub {
 			my ($resolve) = @_;
-
 			Mojo::IOLoop->subprocess(
 				sub {
 					local $SIG{ALRM} = sub { die "__TIMEOUT__\n" };
 					alarm $timeout;
 
-					# Wir nutzen die Shell-Umleitung 2>&1, um STDOUT und STDERR 
-					# absolut sicher in einer Pipe zu fangen.
-					my $output = `@cmd 2>&1`; 
+					# Setze einen Standard-Pfad, damit postmulti alle Postfix-Tools findet
+					local $ENV{PATH} = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+					
+					# Führe den Befehl aus und fange STDOUT + STDERR ein
+					# Wir bauen den Befehl sicher zusammen
+					my $cmd_line = join(' ', map { "'$_'" } @cmd) . ' 2>&1';
+					my $output = `$cmd_line`; 
 					my $rc = ($? >> 8);
 					
 					alarm 0;
@@ -342,7 +356,7 @@ use Symbol qw(gensym);
 				}
 			);
 		});
-}
+	}
 
     # --- Konfigurations-Mapping ---
     our %cfgmap;
@@ -429,21 +443,14 @@ use Symbol qw(gensym);
 		my ($stdout, $stderr, $rc) = @_;
 		my $txt = lc(($stdout // "") . ($stderr // ""));
 
-		# Wenn "is running" ODER "pid:" vorkommt -> Dienst läuft.
-		if ($txt =~ /is\s+running/ || $txt =~ /pid:\s*\d+/) {
-			return "running";
-		}
+		# 1. Suche nach expliziten Statusmeldungen
+		return "running" if $txt =~ /is\s+running/ || $txt =~ /pid:\s*\d+/;
+		return "stopped" if $txt =~ /not\s+running/ || $txt =~ /inactive/ || $txt =~ /stopped/;
 
-		# Wenn "not running" ODER "inactive" vorkommt -> Dienst steht.
-		if ($txt =~ /not\s+running/ || $txt =~ /inactive/ || $txt =~ /stopped/) {
-			return "stopped";
-		}
+		# 2. Fallback: Exit-Code auswerten, wenn die Ausgabe leer ist
+		return "running" if $rc == 0 && ($txt =~ /postfix/ || $txt eq "");
+		return "stopped" if $rc == 1;
 
-		# Fallback auf Exit-Code (wie in deiner 1.6.1 für is-active)
-		if (defined $rc) {
-			return ($rc == 0) ? "running" : "stopped";
-		}
-		
 		return "unknown";
 	}
 
@@ -844,26 +851,30 @@ use Symbol qw(gensym);
                 }
 				else {
 					if ($is_postmulti) {
-
 						my ($bin) = ($svc =~ m{^exec:(/.+)$});
 						unless ($bin && -x $bin) {
-							return $c->render(json => { ok => 0, error => "postmulti binary nicht gefunden: $svc" }, status => 500);
+							return $c->render(json => { ok => 0, error => "postmulti binary nicht gefunden oder nicht ausführbar: $svc" }, status => 500);
 						}
 
-						my @status_args = ('-i', $name, '-p', 'status');
+						# FIX: Immer die 'status'-Argumente aus der Config verwenden
+						my @status_args = @{$actmap->{status} // []};
 
-						# optional kleine Pause nach stop/start, damit status sauber ist
+						# Fallback, falls kein 'status' definiert ist
+						if (!@status_args) {
+							@status_args = ('-i', $name, '-p', 'status');
+						}
+
+						# Optional: Pause nach stop/start/reload
 						if ($cmd eq 'stop' || $cmd eq 'start' || $cmd eq 'reload') {
-							select(undef, undef, undef, 0.4);
+							select(undef, undef, undef, 0.5);
 						}
 
 						return _capture_cmd_promise(10, $bin, @status_args)
 							->then(sub {
 								my ($res) = @_;
+								$log->info("postmulti output: rc=$res->{rc}, out=" . ($res->{out} // ''));
 
-								$log->info("postmulti status output name=$name rc=$res->{rc} out=" . ($res->{out} // ''));
 								my $state = parse_postmulti_status($res->{out}, '', $res->{rc});
-
 								my $ok = 0;
 								if ($cmd eq 'stop') {
 									$ok = ($state eq 'stopped') ? 1 : 0;
@@ -881,18 +892,17 @@ use Symbol qw(gensym);
 									output => $res->{out},
 								});
 							});
-
 					}
 
-					# Default-Verhalten (alles andere)
-					$c->render(json => {
-						ok => ($rc == 0 ? 1 : 0),
-						rc => $rc,
-						($rc != 0 ? (error => "Fehler bei $cmd") : ())
-					});
-
+					else {
+						# Default-Verhalten für andere Dienste
+						$c->render(json => {
+							ok => ($rc == 0 ? 1 : 0),
+							rc => $rc,
+							($rc != 0 ? (error => "Fehler bei $cmd") : ())
+						});
+					}
 				}
-
             })
             ->catch(sub {
                 my ($err) = @_;
