@@ -11,8 +11,6 @@ Der Fokus liegt bewusst auf:
 - nachvollziehbaren Aktionen
 - stabiler Integration in bestehende Systeme
 
-Kein UI. Kein Framework-Zirkus. Reine API.
-
 ---
 
 ## Motivation
