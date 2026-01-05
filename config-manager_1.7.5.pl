@@ -794,7 +794,7 @@ use Symbol qw(gensym);
                 : $runner eq 'sh'   ? ('/bin/sh',   $script, @extra)
                 :                    ($script, @extra);
 
-            $action_promise = _script_promise($c, @argv);
+            $action_promise = _capture_cmd_promise(30, @argv)->then(sub { shift->{rc} });
         }
         elsif ($svc eq 'systemctl') {
             # FIX 1.7.1: service="systemctl" bedeutet "systemctl <cmd> <extra...>"
@@ -851,38 +851,27 @@ use Symbol qw(gensym);
                 }
 				else {
 					if ($is_postmulti) {
+						# Hier wird NUR noch der Status geprüft, nachdem stop/start/reload fertig ist
 						my ($bin) = ($svc =~ m{^exec:(/.+)$});
-						unless ($bin && -x $bin) {
-							return $c->render(json => { ok => 0, error => "postmulti binary nicht gefunden oder nicht ausführbar: $svc" }, status => 500);
-						}
-
-						# FIX: Immer die 'status'-Argumente aus der Config verwenden
 						my @status_args = @{$actmap->{status} // []};
+						if (!@status_args) { @status_args = ('-i', $name, '-p', 'status'); }
 
-						# Fallback, falls kein 'status' definiert ist
-						if (!@status_args) {
-							@status_args = ('-i', $name, '-p', 'status');
-						}
-
-						# Optional: Pause nach stop/start/reload
+						# Kurze Pause für Postfix
 						if ($cmd eq 'stop' || $cmd eq 'start' || $cmd eq 'reload') {
-							select(undef, undef, undef, 0.5);
+							select(undef, undef, undef, 0.6);
 						}
 
 						return _capture_cmd_promise(10, $bin, @status_args)
 							->then(sub {
 								my ($res) = @_;
-								$log->info("postmulti output: rc=$res->{rc}, out=" . ($res->{out} // ''));
-
 								my $state = parse_postmulti_status($res->{out}, '', $res->{rc});
+
+								# Logik: Erfolgreich, wenn der Status dem erwarteten Ergebnis entspricht
 								my $ok = 0;
-								if ($cmd eq 'stop') {
-									$ok = ($state eq 'stopped') ? 1 : 0;
-								} elsif ($cmd eq 'status') {
-									$ok = 1;
-								} else {
-									$ok = ($state eq 'running') ? 1 : 0;
-								}
+								if ($cmd eq 'stop')      { $ok = ($state eq 'stopped') ? 1 : 0; }
+								elsif ($cmd eq 'start')   { $ok = ($state eq 'running') ? 1 : 0; }
+								elsif ($cmd eq 'reload') { $ok = ($state eq 'running') ? 1 : 0; }
+								elsif ($cmd eq 'status') { $ok = 1; }
 
 								$c->render(json => {
 									ok     => $ok,
@@ -893,7 +882,6 @@ use Symbol qw(gensym);
 								});
 							});
 					}
-
 					else {
 						# Default-Verhalten für andere Dienste
 						$c->render(json => {
@@ -902,7 +890,7 @@ use Symbol qw(gensym);
 							($rc != 0 ? (error => "Fehler bei $cmd") : ())
 						});
 					}
-				}
+				}	
             })
             ->catch(sub {
                 my ($err) = @_;
