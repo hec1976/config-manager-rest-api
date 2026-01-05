@@ -445,18 +445,17 @@ use Symbol qw(gensym);
 		my $txt = lc(($stdout // "") . "\n" . ($stderr // ""));
 		$txt =~ s/\r//g;
 
-		# klare "down" Hinweise
+		# Dein konkretes postfix-script Output Format
+		return "running" if $txt =~ /\bpostfix mail system is running\b/;
+		return "stopped" if $txt =~ /\bpostfix mail system is not running\b/;
+
+		# weitere gaengige Varianten
+		return "running" if $txt =~ /\bis\s+running\b/ && $txt =~ /\bpid\b/;
 		return "stopped" if $txt =~ /\bnot\s+running\b/;
-		return "stopped" if $txt =~ /\binactive\b/;
-		return "stopped" if $txt =~ /\bdead\b/;
-		return "stopped" if $txt =~ /\bstopp?ed\b/;
+		return "stopped" if $txt =~ /\b(stopp?ed|inactive|dead)\b/;
+		return "running" if $txt =~ /\b(active|running)\b/;
 
-		# klare "up" Hinweise
-		return "running" if $txt =~ /\bactive\b/ && $txt =~ /\brunning\b/;   # active (running)
-		return "running" if $txt =~ /\brunning\b/;
-
-		# Fallback wenn Output leer oder unklar ist
-		# Bei status ist rc oft die beste Naeherung: 0 ist up, !=0 ist down
+		# Fallback
 		return ($rc == 0) ? "running" : "stopped";
 	}
 
