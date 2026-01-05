@@ -445,19 +445,20 @@ use Symbol qw(gensym);
 		my $txt = lc(($stdout // "") . "\n" . ($stderr // ""));
 		$txt =~ s/\r//g;
 
-		# Dein konkretes postfix-script Output Format
-		return "running" if $txt =~ /\bpostfix mail system is running\b/;
+		# 1) harte "down" Signale
 		return "stopped" if $txt =~ /\bpostfix mail system is not running\b/;
-
-		# weitere gaengige Varianten
-		return "running" if $txt =~ /\bis\s+running\b/ && $txt =~ /\bpid\b/;
 		return "stopped" if $txt =~ /\bnot\s+running\b/;
 		return "stopped" if $txt =~ /\b(stopp?ed|inactive|dead)\b/;
-		return "running" if $txt =~ /\b(active|running)\b/;
+		return "stopped" if $txt =~ /\bfatal\b/;
 
-		# Fallback
-		return ($rc == 0) ? "running" : "stopped";
+		# 2) harte "up" Signale (dein konkretes Format)
+		# Beispiel: "the Postfix mail system is running: PID: 27418"
+		return "running" if $txt =~ /\bpostfix mail system is running\b/ && $txt =~ /\bpid:\s*\d+\b/;
+
+		# 3) wenn output leer oder nicht eindeutig: nicht raten
+		return "unknown";
 	}
+
 
 
 
@@ -877,11 +878,13 @@ use Symbol qw(gensym);
 								my $state = parse_postmulti_status($res->{out}, '', $res->{rc});
 
 								my $ok = 0;
-								if ($cmd eq 'stop') {
+								if ($cmd eq 'status') {
+									$ok = 1;  # status ist Abfrage, nicht Fehler
+								}
+								elsif ($cmd eq 'stop') {
 									$ok = ($state eq 'stopped') ? 1 : 0;
-								} elsif ($cmd eq 'status') {
-									 $ok = 1;
-								} else {
+								}
+								else {
 									# start, reload, sonstiges
 									$ok = ($state eq 'running') ? 1 : 0;
 								}
