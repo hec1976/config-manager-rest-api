@@ -1,0 +1,55 @@
+<svg width="1200" height="300" viewBox="0 0 1200 300" xmlns="http://www.w3.org/2000/svg">
+  <!-- Hintergrund: GitHub Dark Mode Style -->
+  <rect width="1200" height="300" fill="#0d1117" />
+  
+  <!-- Dekorative Netz-Linien (Technik-Look) -->
+  <g stroke="#30363d" stroke-width="1">
+    <line x1="0" y1="50" x2="1200" y2="50" />
+    <line x1="0" y1="150" x2="1200" y2="150" />
+    <line x1="0" y1="250" x2="1200" y2="250" />
+    <line x1="200" y1="0" x2="200" y2="300" />
+    <line x1="1000" y1="0" x2="1000" y2="300" />
+  </g>
+
+  <!-- Akzent-Farbe (Blau für Vertrauen/Enterprise) -->
+  <rect x="0" y="0" width="10" height="300" fill="#2188ff" />
+
+  <!-- Logo/Icon: Schild mit Blitz (Security + Performance) -->
+  <g transform="translate(80, 85)">
+    <path d="M40 0 L80 20 L80 60 C80 90 40 110 40 110 C40 110 0 90 0 60 L0 20 Z" fill="#2188ff" opacity="0.2" />
+    <path d="M40 10 L70 25 L70 55 C70 80 40 95 40 95 C40 95 10 80 10 55 L10 25 Z" stroke="#2188ff" stroke-width="4" fill="none" />
+    <path d="M45 25 L25 55 L40 55 L35 85 L55 55 L40 55 Z" fill="#2188ff" />
+  </g>
+
+  <!-- Haupttitel -->
+  <text x="220" y="130" font-family="Arial, sans-serif" font-size="65" font-weight="bold" fill="#ffffff">
+    CONFIG-MANAGER <tspan fill="#2188ff">REST</tspan>
+  </text>
+  
+  <!-- Untertitel -->
+  <text x="220" y="180" font-family="Arial, sans-serif" font-size="28" fill="#8b949e">
+    Hardened API Middleware | Enterprise Service Control
+  </text>
+
+  <!-- Version Badge -->
+  <rect x="220" y="210" width="110" height="35" rx="17" fill="#238636" />
+  <text x="275" y="234" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#ffffff" text-anchor="middle">
+    v1.7.5
+  </text>
+
+  <!-- Feature Tags -->
+  <text x="350" y="234" font-family="Courier New, monospace" font-size="16" fill="#f1e05a">
+    ● Path-Guard  ● Atomic-Writes  ● Async-Mojo
+  </text>
+
+  <!-- Terminal Preview auf der rechten Seite -->
+  <rect x="750" y="70" width="400" height="160" rx="10" fill="#161b22" stroke="#30363d" stroke-width="2" />
+  <circle cx="775" cy="90" r="5" fill="#ff5f56" />
+  <circle cx="790" cy="90" r="5" fill="#ffbd2e" />
+  <circle cx="805" cy="90" r="5" fill="#27c93f" />
+  <text x="770" y="130" font-family="monospace" font-size="14" fill="#7ee787">POST /action/postfix/reload</text>
+  <text x="770" y="155" font-family="monospace" font-size="14" fill="#ffffff">{</text>
+  <text x="785" y="175" font-family="monospace" font-size="14" fill="#79c0ff">  "ok":</text> <text x="830" y="175" font-family="monospace" font-size="14" fill="#ffffff">1,</text>
+  <text x="785" y="195" font-family="monospace" font-size="14" fill="#79c0ff">  "status":</text> <text x="860" y="195" font-family="monospace" font-size="14" fill="#a5d6ff">"running"</text>
+  <text x="770" y="215" font-family="monospace" font-size="14" fill="#ffffff">}</text>
+</svg>
