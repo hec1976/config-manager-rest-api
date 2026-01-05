@@ -443,22 +443,32 @@ use Symbol qw(gensym);
     }
 
 	sub parse_postmulti_status {
-		my ($stdout, $stderr, $rc) = @_;
-		my $txt = lc(($stdout // "") . "\n" . ($stderr // ""));
-		$txt =~ s/\r//g;
+		my ($combined_out, $stderr_unused, $rc) = @_;
+		# Wir nehmen die komplette Ausgabe (stdout + stderr) und machen sie kleingeschrieben
+		my $txt = lc($combined_out // "");
+		
+		# DEBUG (optional): $log->info("Analysiere Text: $txt");
 
-		# 1) STOPPED-Erkennung (Priorität)
-		return "stopped" if $txt =~ /mail system is not running/;
-		return "stopped" if $txt =~ /\bis\s+not\s+running/;
-		return "stopped" if $txt =~ /\bnot\s+running\b/;
-		return "stopped" if $txt =~ /\b(stopp?ed|inactive|dead|fatal)\b/;
+		# 1. Höchste Priorität: Positive Merkmale (Running)
+		# Wenn "is running" vorkommt ODER eine PID (Prozess-ID) genannt wird, läuft Postfix.
+		if ($txt =~ /is\s+running/ || $txt =~ /pid:\s*\d+/) {
+			return "running";
+		}
 
-		# 2) RUNNING-Erkennung (Flexibler für Instanz-Präfixe)
-		return "running" if $txt =~ /mail system is running/;
-		return "running" if $txt =~ /is\s+running/ && $txt =~ /postfix/;
+		# 2. Negative Merkmale (Stopped)
+		# Wenn "not running" oder explizite Stop-Begriffe fallen.
+		if ($txt =~ /not\s+running/ || $txt =~ /stopped/ || $txt =~ /inactive/ || $txt =~ /dead/) {
+			return "stopped";
+		}
 
-		# 3) Fallback: Wenn RC 0 ist und "postfix" in der Ausgabe vorkommt
-		return "running" if $rc == 0 && $txt =~ /postfix/;
+		# 3. Fallback über den Exit-Code (Postfix Standard)
+		# Bei 'postfix status' bedeutet Exit-Code 0 immer "Running".
+		if (defined $rc && $rc == 0 && $txt =~ /postfix/) {
+			return "running";
+		}
+
+		# Wenn RC > 0 und wir oben nichts gefunden haben, ist es meist gestoppt
+		return "stopped" if defined $rc && $rc > 0;
 
 		return "unknown";
 	}
