@@ -326,34 +326,37 @@ use Symbol qw(gensym);
 					open(STDIN, '<', '/dev/null') or die "open /dev/null: $!";
 
 					my $err = gensym;
-                my $pid = open3(my $in, my $out, $err, @cmd);
-                close $in;
+					my $pid = open3(my $in, my $out, $err, @cmd);
+					close $in;
 
-                my $stdout = do { local $/; <$out> // "" };
-                my $stderr = do { local $/; <$err> // "" };
+					my $stdout = do { local $/; <$out> // "" };
+					my $stderr = do { local $/; <$err> // "" };
 
-                waitpid($pid, 0);
-                alarm 0;
+					waitpid($pid, 0);
+					alarm 0;
 
-                my $raw = $?;
-                my $rc  = ($raw >> 8);
+					my $raw = $?;
+					my $rc  = ($raw >> 8);
 
-                return { rc => $rc, out => ($stdout . $stderr) };
-            },
-            sub {
-                my ($subprocess, $err, $res) = @_;
-                if (defined $err && length $err) {
-                    if ($err =~ /__TIMEOUT__/) {
-                        return $resolve->({ rc => -1, out => "timeout nach ${timeout}s" });
-                    }
-                    return $resolve->({ rc => -1, out => $err });
-                }
-                $res ||= { rc => -1, out => '' };
-                return $resolve->($res);
-            }
-        );
-    });
-}
+					return { rc => $rc, out => ($stdout . $stderr) };
+				},
+				sub {
+					my ($subprocess, $err, $res) = @_;
+
+					if (defined $err && length $err) {
+						if ($err =~ /__TIMEOUT__/) {
+							return $resolve->({ rc => -1, out => "timeout nach ${timeout}s" });
+						}
+						return $resolve->({ rc => -1, out => $err });
+					}
+
+					$res ||= { rc => -1, out => '' };
+					return $resolve->($res);
+				}
+			);
+		});
+	}
+
 
 
     # --- Konfigurations-Mapping ---
