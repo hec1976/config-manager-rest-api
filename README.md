@@ -113,6 +113,63 @@ cpanm Mojolicious
 
 ---
 
+##  API-Routen & Endpunkte
+
+Alle Anfragen müssen den Header `X-API-Token` oder einen Bearer-Token zur Authentifizierung enthalten.
+
+### Konfigurations-Management
+
+| Methode | Route | Beschreibung |
+| :--- | :--- | :--- |
+| `GET` | `/configs` | Listet alle verwalteten Konfigurationen und verfügbaren Aktionen auf. |
+| `GET` | `/config/:name` | Lädt den aktuellen Inhalt der Konfigurationsdatei herunter. |
+| `POST` | `/config/:name` | Schreibt neuen Inhalt. Erstellt automatisch ein Backup vor dem Speichern. |
+
+### Backup & Wiederherstellung
+
+| Methode | Route | Beschreibung |
+| :--- | :--- | :--- |
+| `GET` | `/backups/:name` | Listet alle verfügbaren Backups für eine spezifische Konfiguration auf. |
+| `GET` | `/backupcontent/:name/:file` | Liest den Inhalt eines spezifischen Backups aus. |
+| `POST` | `/restore/:name/:file` | Stellt eine Konfiguration aus einem Backup wieder her. |
+
+### Dienst-Steuerung (Actions)
+
+| Methode | Route | Beschreibung |
+| :--- | :--- | :--- |
+| `POST` | `/action/:name/:cmd` | Führt eine Aktion aus (z. B. `reload`, `restart`, `status`). |
+
+> **Hinweis:** Die Route `/action` unterstützt spezialisierte Logik für Systemdienste. Bei einem `reload` oder `restart` verifiziert der Agent automatisch den Status des Dienstes nach einer definierten Ruhezeit (*Settle-Time*), um sicherzustellen, dass der Dienst korrekt läuft.
+
+### System-Schnittstellen
+
+| Methode | Route | Beschreibung |
+| :--- | :--- | :--- |
+| `GET` | `/health` | Health-Check der API (gibt `{"status": "ok"}` zurück). |
+| `GET` | `/raw/configs` | Exportiert die interne Mapping-Tabelle als rohes JSON. |
+| `POST` | `/raw/configs/reload` | Lädt die interne Konfiguration vom Dateisystem neu. |
+
+---
+
+## CI/CD Integration
+
+Dank der strukturierten JSON-Antworten lässt sich der Agent nahtlos in Pipelines integrieren.
+
+**Beispiel: Automatischer Deployment-Check**
+```bash
+# Konfiguration hochladen
+curl -X POST -H "X-API-Token: $TOKEN" --data-binary @main.cf https://api/config/postfix
+
+# Dienst neu laden und Status prüfen
+RESPONSE=$(curl -s -X POST -H "X-API-Token: $TOKEN" https://api/action/postfix/reload)
+
+# Validierung der Antwort
+if [[ $(echo $RESPONSE | jq -r '.status') != "running" ]]; then
+  echo "Fehler! Rollback einleiten..."
+  curl -X POST -H "X-API-Token: $TOKEN" https://api/restore/postfix/latest
+fi
+```
+---
 ## Betrieb
 
 Die API wird als normaler Prozess gestartet und laesst sich problemlos als systemd-Service betreiben.
@@ -125,22 +182,7 @@ Nach dem Start stellt die API ihre Endpunkte ueber HTTP bereit.
 
 ---
 
-## Schnittstelle
 
-Die API stellt ausschliesslich JSON-Endpunkte bereit.
-Alle Antworten sind explizit und maschinenlesbar.
-
-Typische Operationen:
-- Auflisten verfuegbarer Konfigurationen
-- Lesen einer Konfiguration
-- Schreiben einer Konfiguration
-- Ausfuehren definierter Aktionen
-- Auflisten und Wiederherstellen von Backups
-- Health-Check
-
-Die konkrete Auspraegung erfolgt bewusst konfigurationsgetrieben und ist nicht Teil dieser README.
-
----
 
 ## Logging und Nachvollziehbarkeit
 
