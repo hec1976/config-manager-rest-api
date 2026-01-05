@@ -853,36 +853,45 @@ use Symbol qw(gensym);
                 }
 				else {
 					if ($is_postmulti) {
-						# Hier wird NUR noch der Status geprüft, nachdem stop/start/reload fertig ist
 						my ($bin) = ($svc =~ m{^exec:(/.+)$});
+						
+						# Argumente für den Status-Check ermitteln
 						my @status_args = @{$actmap->{status} // []};
 						if (!@status_args) { @status_args = ('-i', $name, '-p', 'status'); }
 
-						# Kurze Pause für Postfix
-						if ($cmd eq 'stop' || $cmd eq 'start' || $cmd eq 'reload') {
+						# Kurze Pause für Postfix (Settle Time), damit die PID-Files aktuell sind
+						if ($cmd eq 'stop' || $cmd eq 'start' || $cmd eq 'reload' || $cmd eq 'restart') {
 							select(undef, undef, undef, 0.6);
 						}
 
+						# Jetzt den tatsächlichen Status abfragen
 						return _capture_cmd_promise(10, $bin, @status_args)
 							->then(sub {
 								my ($res) = @_;
 								my $state = parse_postmulti_status($res->{out}, '', $res->{rc});
 
-								# Logik: Erfolgreich, wenn der Status dem erwarteten Ergebnis entspricht
+								# Präzise Erfolgslogik für Postmulti
 								my $ok = 0;
-								if ($cmd eq 'stop')      { $ok = ($state eq 'stopped') ? 1 : 0; }
-								elsif ($cmd eq 'start')   { $ok = ($state eq 'running') ? 1 : 0; }
-								elsif ($cmd eq 'reload') { $ok = ($state eq 'running') ? 1 : 0; }
-								elsif ($cmd eq 'status') { $ok = 1; }
+								if    ($cmd eq 'stop')      { $ok = ($state eq 'stopped') ? 1 : 0; }
+								elsif ($cmd eq 'status')    { $ok = 1; } # Abfrage an sich war erfolgreich
+								else                        { $ok = ($state eq 'running') ? 1 : 0; } # start/reload/restart
 
+								# Wir senden 'state' (für Postmulti-Logik) 
+								# UND 'status' (für Kompatibilität zur GUI) zurück
 								$c->render(json => {
 									ok     => $ok,
 									action => $cmd,
-									state  => $state,
+									state  => $state,   # Dein neuer Standard
+									status => $state,   # Backup für die GUI
 									rc     => $res->{rc},
 									output => $res->{out},
 								});
 							});
+					}
+					
+					# --- 2. PRIORITÄT: Standard-Systemctl Logik ---
+					elsif ($cmd eq 'daemon-reload' || $svc eq 'systemctl') {
+						$c->render(json => $rc == 0 ? { ok => 1 } : { ok => 0, error => "Rueckgabewert=$rc" });
 					}
 					else {
 						# Default-Verhalten für andere Dienste
