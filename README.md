@@ -67,7 +67,7 @@ Alle sicherheitsrelevanten Ereignisse werden geloggt.
 
 ---
 
-## Vergleich: Config-Manager  nax 10 Server vs. andere Lösungen
+## Vergleich: Config-Manager max 10 Server vs. andere Lösungen
 
 | Feature | **Config-Manager (REST)** | Ansible / Salt | Server-Panels (Cockpit/Webmin) | Eigene Bash-Skripte |
 | :--- | :--- | :--- | :--- | :--- |
