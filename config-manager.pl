@@ -236,6 +236,20 @@ use Symbol qw(gensym);
 
     my $safe_write_file = sub {
         my ($p, $bytes) = @_;
+        die "Pfad fehlt" unless defined $p && length $p;
+    
+        my $file = path($p);
+        my $dir  = $file->dirname->to_string;
+    
+        # Wenn wir im Zielverzeichnis kein tmp-File anlegen koennen, dann bringt atomic nichts.
+        # Dann direkt plain schreiben (funktioniert fuer existierende Files, und fuer erlaubte Pfade).
+        my $dir_writable = (-d $dir && -w $dir) ? 1 : 0;
+    
+        if (!$dir_writable) {
+            path($p)->spew($bytes);
+            return 'plain';
+        }
+    
         my $method = 'atomic';
         my $ok = eval { $write_atomic->($p, $bytes); 1 };
         if (!$ok) {
