@@ -307,36 +307,26 @@ use Symbol qw(gensym);
     my $capture_cmd_promise = sub {
         my ($timeout, @cmd) = @_;
         $timeout = 10 unless defined $timeout && $timeout =~ /^\d+$/;
-
+    
+        # 1. Jedes Argument validieren
+        for my $arg (@cmd) {
+            die "Ungueltiges Argument: $arg" if $arg =~ m{[^\w\-\.\/=,+@: ]};
+        }
+    
+        # 2. Keine Shell verwenden (argv-Array direkt an exec übergeben)
         return Mojo::Promise->new(sub {
             my ($resolve) = @_;
-
+    
             Mojo::IOLoop->subprocess(
                 sub {
                     local $SIG{ALRM} = sub { die "__TIMEOUT__\n" };
                     alarm $timeout;
-
+    
+                    # 3. PATH einschränken
                     local $ENV{PATH} = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-
-                    my $errfh = gensym;
-                    my $pid = open3(my $in, my $out, $errfh, @cmd);
-                    close $in;
-
-                    my $buf = '';
-                    for my $fh ($out, $errfh) {
-                        while (1) {
-                            my $chunk = '';
-                            my $r = sysread($fh, $chunk, 8192);
-                            last unless $r;
-                            $buf .= $chunk;
-                        }
-                    }
-
-                    waitpid($pid, 0);
-                    my $rc = ($? >> 8);
-
-                    alarm 0;
-                    return { rc => $rc, out => ($buf // "") };
+    
+                    # 4. exec statt system verwenden (keine Shell!)
+                    exec @cmd or die "exec fehlgeschlagen: $!";
                 },
                 sub {
                     my ($subprocess, $err, $res) = @_;
@@ -349,6 +339,7 @@ use Symbol qw(gensym);
             );
         });
     };
+
 
     my $parse_postmulti_status = sub {
         my ($stdout, $stderr, $rc) = @_;
