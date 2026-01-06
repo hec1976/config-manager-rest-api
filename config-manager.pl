@@ -112,8 +112,9 @@ use Symbol qw(gensym);
 
     my $bad_name = sub {
         my ($s) = @_;
-        return 1 if !defined $s;
-        return 1 if $s =~ m{[/\\]};
+        return 1 if !defined $s || $s =~ m{[/\\]};  # Blockiert Schrägstriche
+        return 1 if $s =~ m{\.\.} || $s =~ m{^\.};  # Blockiert ".." und Dateinamen, die mit "." beginnen
+        return 1 if $s =~ m{[^\w\-\.\_]};           # Erlaubt nur alphanumerische Zeichen, Bindestriche, Punkte und Unterstriche
         return 0;
     };
 
