@@ -116,8 +116,10 @@ use Symbol qw(gensym);
 
     my $bad_name = sub {
         my ($s) = @_;
-        return 1 if !defined $s;
-        return 1 if $s =~ m{[/\\]};
+        return 1 unless defined $s;
+        return 1 if length($s) < 1 || length($s) > 80;
+        return 1 unless $s =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/;
+        return 1 if $s =~ /\.\./;
         return 0;
     };
 
