@@ -16,6 +16,8 @@ use Text::ParseWords qw(shellwords);
 
 use IPC::Open3;
 use Symbol qw(gensym);
+use IO::Select ();
+use POSIX qw(setpgid);
 
 {
     umask 0007;
@@ -304,37 +306,61 @@ use Symbol qw(gensym);
     
             Mojo::IOLoop->subprocess(
                 sub {
-                    local $SIG{ALRM} = sub { die "__TIMEOUT__\n" };
-                    alarm $timeout;
-    
                     local $ENV{PATH} = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
     
                     my ($bin, @args) = @cmd;
-    
                     die "Missing command" unless defined $bin && length $bin;
     
-                    # Bin muss absoluter Pfad sein und darf keine Spaces enthalten
-                    die "Bad command path" unless $bin =~ m{\A/[\w.\-\/]+\z};
+                    # Bin: absolut, ASCII, keine Spaces
+                    die "Bad command path" unless $bin =~ m{\A/[A-Za-z0-9._/-]+\z};
                     die "Command not executable" unless -x $bin;
     
                     # Args: enges Whitelisting, keine Spaces
                     for my $a (@args) {
-                        die "Bad arg" unless defined $a;
-                        die "Bad arg" if $a eq '';
+                        die "Bad arg" unless defined $a && length $a;
                         die "Bad arg" unless $a =~ /\A[A-Za-z0-9._:+@\/=\-,]+\z/;
                     }
     
                     my $errfh = gensym;
-                    my $pid = open3(my $in, my $out, $errfh, $bin, @args);
+    
+                    my $pid;
+                    local $SIG{ALRM} = sub {
+                        if ($pid) {
+                            # kill process group if possible, else child
+                            kill 'TERM', -$pid;
+                            kill 'TERM',  $pid;
+                            select(undef, undef, undef, 0.2);
+                            kill 'KILL', -$pid;
+                            kill 'KILL',  $pid;
+                        }
+                        die "__TIMEOUT__\n";
+                    };
+    
+                    alarm $timeout;
+    
+                    $pid = open3(my $in, my $out, $errfh, $bin, @args);
                     close $in;
     
+                    # eigene Prozessgruppe: nach dem fork, im Parent setzen
+                    eval { setpgid($pid, $pid); 1 };
+    
                     my $buf = '';
-                    for my $fh ($out, $errfh) {
-                        while (1) {
+    
+                    # stdout/stderr parallel lesen (verhindert pipe-deadlock)
+                    my $sel = IO::Select->new();
+                    $sel->add($out);
+                    $sel->add($errfh);
+    
+                    while ($sel->count) {
+                        for my $fh ($sel->can_read(1)) {
                             my $chunk = '';
                             my $r = sysread($fh, $chunk, 8192);
-                            last unless $r;
-                            $buf .= $chunk;
+                            if ($r) {
+                                $buf .= $chunk;
+                                next;
+                            }
+                            $sel->remove($fh);
+                            close $fh;
                         }
                     }
     
@@ -346,16 +372,17 @@ use Symbol qw(gensym);
                 },
                 sub {
                     my ($subprocess, $err, $res) = @_;
+    
                     if (defined $err && $err =~ /__TIMEOUT__/) {
                         return $resolve->({ rc => -1, out => "TIMEOUT after ${timeout}s\n" });
                     }
+    
                     $res ||= { rc => -1, out => ($err // "unknown error") };
                     return $resolve->($res);
                 }
             );
         });
     };
-
 
     my $parse_postmulti_status = sub {
         my ($stdout, $stderr, $rc) = @_;
