@@ -756,7 +756,9 @@ use POSIX qw(setpgid);
         elsif ($svc =~ m{^(bash|sh|perl|exec):(/.+)$}) {
             my ($runner, $script) = ($1, $2);
             return $json_err->($c, 404, "Skript nicht gefunden: $script") unless -f $script;
-
+            return $json_err->($c, 400, "Symlink Script verboten: $script") if -l $script;
+            return $json_err->($c, 400, "Script Pfad nicht erlaubt: $script") unless $is_allowed_path->($script);
+            
             if ($runner eq 'exec' && $script =~ m{/systemctl$}) {
                 return $json_err->($c, 400, 'Subcommand verboten')
                     if ($extra[0] // '') =~ /^(poweroff|reboot|halt)$/;
