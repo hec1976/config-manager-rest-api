@@ -298,21 +298,36 @@ use Symbol qw(gensym);
     my $capture_cmd_promise = sub {
         my ($timeout, @cmd) = @_;
         $timeout = 10 unless defined $timeout && $timeout =~ /^\d+$/;
-
+    
         return Mojo::Promise->new(sub {
             my ($resolve) = @_;
-
+    
             Mojo::IOLoop->subprocess(
                 sub {
                     local $SIG{ALRM} = sub { die "__TIMEOUT__\n" };
                     alarm $timeout;
-
+    
                     local $ENV{PATH} = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-
+    
+                    my ($bin, @args) = @cmd;
+    
+                    die "Missing command" unless defined $bin && length $bin;
+    
+                    # Bin muss absoluter Pfad sein und darf keine Spaces enthalten
+                    die "Bad command path" unless $bin =~ m{\A/[\w.\-\/]+\z};
+                    die "Command not executable" unless -x $bin;
+    
+                    # Args: enges Whitelisting, keine Spaces
+                    for my $a (@args) {
+                        die "Bad arg" unless defined $a;
+                        die "Bad arg" if $a eq '';
+                        die "Bad arg" unless $a =~ /\A[A-Za-z0-9._:+@\/=\-,]+\z/;
+                    }
+    
                     my $errfh = gensym;
-                    my $pid = open3(my $in, my $out, $errfh, @cmd);
+                    my $pid = open3(my $in, my $out, $errfh, $bin, @args);
                     close $in;
-
+    
                     my $buf = '';
                     for my $fh ($out, $errfh) {
                         while (1) {
@@ -322,10 +337,10 @@ use Symbol qw(gensym);
                             $buf .= $chunk;
                         }
                     }
-
+    
                     waitpid($pid, 0);
                     my $rc = ($? >> 8);
-
+    
                     alarm 0;
                     return { rc => $rc, out => ($buf // "") };
                 },
@@ -340,6 +355,7 @@ use Symbol qw(gensym);
             );
         });
     };
+
 
     my $parse_postmulti_status = sub {
         my ($stdout, $stderr, $rc) = @_;
