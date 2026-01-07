@@ -761,8 +761,8 @@ use POSIX qw(setpgid);
             
             if ($runner eq 'exec' && $script =~ m{/systemctl$}) {
                 return $json_err->($c, 400, 'Subcommand verboten')
-                    if ($extra[0] // '') =~ /^(poweroff|reboot|halt|kexec|suspend|hibernate|hybrid-sleep|sleep|rescue|emergency|isolate|daemon-reexec|set-default|default|exit|mask|unmask|enable|disable|link|preset|preset-all|edit|cat)$/i;
-            }
+                    if ($extra[0] // '') =~ /^(poweroff|reboot|halt|kexec|suspend|hibernate|hybrid-sleep|sleep|rescue|emergency|isolate|daemon-reexec|set-default|default|exit|mask|unmask|enable|disable|link|preset|preset-all|edit|cat|reset-failed)$/i;
+            }   
             
             my @argv =
                   $runner eq 'perl' ? ('/usr/bin/perl', $script, @extra)
