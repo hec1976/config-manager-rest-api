@@ -72,7 +72,11 @@ use Symbol qw(gensym);
     my $api_token = (defined $ENV{API_TOKEN} && $ENV{API_TOKEN} ne '')
         ? $ENV{API_TOKEN}
         : $global->{api_token};
-
+        
+    # Hart erzwingen: ohne Token kein Start
+    die "FATAL: api_token fehlt. Setze global.json api_token oder ENV API_TOKEN.\n"
+        unless defined $api_token && length $api_token;
+        
     my $allowed_ips = $global->{allowed_ips};
     $allowed_ips = [] unless ref($allowed_ips) eq 'ARRAY';
 
