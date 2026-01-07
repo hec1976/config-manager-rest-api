@@ -112,9 +112,8 @@ use Symbol qw(gensym);
 
     my $bad_name = sub {
         my ($s) = @_;
-        return 1 if !defined $s || $s =~ m{[/\\]};  # Blockiert Schrägstriche
-        return 1 if $s =~ m{\.\.} || $s =~ m{^\.};  # Blockiert ".." und Dateinamen, die mit "." beginnen
-        return 1 if $s =~ m{[^\w\-\.\_]};           # Erlaubt nur alphanumerische Zeichen, Bindestriche, Punkte und Unterstriche
+        return 1 if !defined $s;
+        return 1 if $s =~ m{[/\\]};
         return 0;
     };
 
@@ -237,20 +236,6 @@ use Symbol qw(gensym);
 
     my $safe_write_file = sub {
         my ($p, $bytes) = @_;
-        die "Pfad fehlt" unless defined $p && length $p;
-    
-        my $file = path($p);
-        my $dir  = $file->dirname->to_string;
-    
-        # Wenn wir im Zielverzeichnis kein tmp-File anlegen koennen, dann bringt atomic nichts.
-        # Dann direkt plain schreiben (funktioniert fuer existierende Files, und fuer erlaubte Pfade).
-        my $dir_writable = (-d $dir && -w $dir) ? 1 : 0;
-    
-        if (!$dir_writable) {
-            path($p)->spew($bytes);
-            return 'plain';
-        }
-    
         my $method = 'atomic';
         my $ok = eval { $write_atomic->($p, $bytes); 1 };
         if (!$ok) {
@@ -307,26 +292,36 @@ use Symbol qw(gensym);
     my $capture_cmd_promise = sub {
         my ($timeout, @cmd) = @_;
         $timeout = 10 unless defined $timeout && $timeout =~ /^\d+$/;
-    
-        # 1. Jedes Argument validieren
-        for my $arg (@cmd) {
-            die "Ungueltiges Argument: $arg" if $arg =~ m{[^\w\-\.\/=,+@: ]};
-        }
-    
-        # 2. Keine Shell verwenden (argv-Array direkt an exec übergeben)
+
         return Mojo::Promise->new(sub {
             my ($resolve) = @_;
-    
+
             Mojo::IOLoop->subprocess(
                 sub {
                     local $SIG{ALRM} = sub { die "__TIMEOUT__\n" };
                     alarm $timeout;
-    
-                    # 3. PATH einschränken
+
                     local $ENV{PATH} = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    
-                    # 4. exec statt system verwenden (keine Shell!)
-                    exec @cmd or die "exec fehlgeschlagen: $!";
+
+                    my $errfh = gensym;
+                    my $pid = open3(my $in, my $out, $errfh, @cmd);
+                    close $in;
+
+                    my $buf = '';
+                    for my $fh ($out, $errfh) {
+                        while (1) {
+                            my $chunk = '';
+                            my $r = sysread($fh, $chunk, 8192);
+                            last unless $r;
+                            $buf .= $chunk;
+                        }
+                    }
+
+                    waitpid($pid, 0);
+                    my $rc = ($? >> 8);
+
+                    alarm 0;
+                    return { rc => $rc, out => ($buf // "") };
                 },
                 sub {
                     my ($subprocess, $err, $res) = @_;
@@ -339,7 +334,6 @@ use Symbol qw(gensym);
             );
         });
     };
-
 
     my $parse_postmulti_status = sub {
         my ($stdout, $stderr, $rc) = @_;
