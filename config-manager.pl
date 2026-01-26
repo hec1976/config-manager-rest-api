@@ -20,6 +20,8 @@ use IPC::Open3;
 use Symbol qw(gensym);
 use IO::Select ();
 use POSIX qw(setpgid);
+use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
+
 
 {
     umask 0007;
@@ -117,6 +119,37 @@ use POSIX qw(setpgid);
     my %ALLOW_ORIGIN = map { $_ => 1 } (ref($global->{allow_origins}) eq 'ARRAY' ? @{$global->{allow_origins}} : ());
 
     # ---------------- helpers ----------------
+
+	# Hilfsfunktion für Bcrypt-Verifizierung (kompatibel zu PHP password_hash)
+	my $verify_bcrypt = sub {
+		my ($plain, $hash) = @_;
+		return 0 unless defined $plain && defined $hash;
+
+		# akzeptiere $2a$, $2y$, $2b$ und exakt 60 Zeichen Format
+		return 0 unless $hash =~ /^\$2[aby]\$\d{2}\$[\.\/A-Za-z0-9]{53}$/;
+
+		# Perl Modul kann je nach Build zickig sein mit 2y/2b, darum auf 2a normalisieren
+		my $perl_safe_hash = $hash;
+		$perl_safe_hash =~ s/^\$2[yb]\$/\$2a\$/;
+
+		# settings: "$2a$10$<22salt>" (29 chars)
+		my $settings = substr($perl_safe_hash, 0, 29);
+		return 0 unless length($settings) == 29;
+
+		my $calc;
+		my $ok = eval {
+			$calc = bcrypt($plain, $settings);
+			1;
+		};
+		return 0 unless $ok && defined $calc && length $calc;
+
+		# calc wieder auf original prefix bringen, dann compare gegen original hash
+		$calc =~ s/^\$2a\$/\$2y\$/ if $hash =~ /^\$2y\$/;
+		$calc =~ s/^\$2a\$/\$2b\$/ if $hash =~ /^\$2b\$/;
+
+		return secure_compare($calc, $hash) ? 1 : 0;
+	};
+
 
     my $bad_name = sub {
         my ($s) = @_;
@@ -901,13 +934,15 @@ use POSIX qw(setpgid);
 
     # ---------------- hooks ----------------
 
-    app->hook(before_dispatch => sub {
+	app->hook(before_dispatch => sub {
         my $c = shift;
 
+        # Request Metadaten stashen
         $c->stash(req_id => sprintf('%x-%x-%04x', int(time() * 1000), $$, rand(0xffff)));
         $c->stash(t0 => steady_time());
         $c->stash(client_ip => $client_ip->($c));
 
+        # CORS Header setzen
         my $origin = $c->req->headers->origin // '*';
         if (%ALLOW_ORIGIN) {
             $c->res->headers->header('Access-Control-Allow-Origin' => ($ALLOW_ORIGIN{$origin} ? $origin : 'null'));
@@ -919,8 +954,11 @@ use POSIX qw(setpgid);
         $c->res->headers->header('Access-Control-Max-Age'       => '86400');
 
         $log->info('REQUEST ' . $fmt_req->($c));
+        
+        # Preflight OPTIONS Request direkt beantworten
         return $c->render(text => '', status => 204) if $c->req->method eq 'OPTIONS';
 
+        # IP-Whitelist Prüfung
         if ($allowed_ips && @{$allowed_ips}) {
             my $rip = $c->stash('client_ip') // '';
             unless (Net::CIDR::cidrlookup($rip, @{$allowed_ips})) {
@@ -929,16 +967,25 @@ use POSIX qw(setpgid);
             }
         }
 
+        # Authentifizierung (Bcrypt oder Plain)
         if (defined $api_token && length $api_token) {
             my $hdr    = $c->req->headers->header('X-API-Token') // '';
             my $auth   = $c->req->headers->authorization // '';
             my $bearer = $auth =~ /^Bearer\s+(.+)/i ? $1 : '';
-            my $token  = $hdr || $bearer;
+            my $token_received = $hdr || $bearer;
 
-            unless ($token && secure_compare($token, $api_token)) {
-                $log->info('REQUEST ' . $fmt_req->($c) . ' -> 401 Unauthorized');
-                return $c->render(status => 401, json => { ok => 0, error => 'Unauthorized' });
-            }
+			my $authenticated = 0;
+
+			if ($api_token =~ /^\$2[aby]\$\d{2}\$/) {
+				$authenticated = ($token_received && $verify_bcrypt->($token_received, $api_token)) ? 1 : 0;
+			} else {
+				$authenticated = ($token_received && secure_compare($token_received, $api_token)) ? 1 : 0;
+			}
+
+			unless ($authenticated) {
+				$log->info('REQUEST ' . $fmt_req->($c) . ' -> 401 Unauthorized');
+				return $c->render(status => 401, json => { ok => 0, error => 'Unauthorized' });
+			}
         }
     });
 
