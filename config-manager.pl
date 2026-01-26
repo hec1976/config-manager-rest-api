@@ -567,27 +567,30 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         $c->render(json => { ok => 1, name => 'config-manager', version => $VERSION, api_endpoints => \@routes_list });
     };
 
-    get '/configs' => sub {
+    get '/config/*name' => sub {
         my $c = shift;
-        my @list;
+        my $name = $c->stash('name');
 
-        for my $name (sort keys %cfgmap) {
-            my $e = $cfgmap{$name};
-            my $filename = path($e->{path})->basename;
-            my ($ext) = $filename =~ /\.([^.]+)$/;
-            my @tokens = sort keys %{$e->{actions} // {}};
+        return $json_err->($c, 400, 'Ungueltiger Name') if $bad_name->($name);
 
-            push @list, {
-                id       => $name,
-                filename => $filename,
-                filetype => lc($ext // 'txt'),
-                category => $e->{category},
-                actions  => \@tokens
-            };
+        my $e = $cfgmap{$name} or return $json_err->($c, 404, "Unbekannt: $name");
+        my $p = $e->{path};
+
+        return $json_err->($c, 400, "Pfad nicht erlaubt") unless $is_allowed_path->($p);
+        return $json_err->($c, 404, "Datei fehlt: $p") unless -f $p;
+
+        my $raw = path($p)->slurp;
+
+        # UTF-8 only: wenn Datei nicht gueltig UTF-8 ist -> 415
+        my $out = eval { $require_valid_utf8->($raw) };
+        if ($@) {
+            return $json_err->($c, 415, 'Datei ist nicht UTF-8 kodiert');
         }
 
-        $c->render(json => { ok => 1, configs => \@list });
+        $c->res->headers->content_type('text/plain; charset=utf-8');
+        $c->render(data => $out);
     };
+
 
     get '/config/*name' => sub {
         my $c = shift;
@@ -717,50 +720,72 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         $c->render(json => { ok => 1, content => $txt });
     };
 
-    post '/restore/*name/*filename' => sub {
-        my $c = shift;
-        my ($name, $filename) = ($c->stash('name'), $c->stash('filename'));
+	post '/restore/*name/*filename' => sub {
+		my $c = shift;
+		my ($name, $filename) = ($c->stash('name'), $c->stash('filename'));
 
-        return $json_err->($c, 400, 'Ungueltiger Name/Filename') if $bad_name->($name) || $bad_name->($filename);
+		return $json_err->($c, 400, 'Ungueltiger Name/Filename')
+			if $bad_name->($name) || $bad_name->($filename);
 
-        my $e = $cfgmap{$name} or return $json_err->($c, 404, "Unbekannte Konfiguration: $name");
+		my $e = $cfgmap{$name}
+			or return $json_err->($c, 404, "Unbekannte Konfiguration: $name");
 
-        my $base = path($e->{path})->basename;
-        my $bdir = $e->{backup_dir};
+		my $base = path($e->{path})->basename;
+		my $bdir = $e->{backup_dir};
 
-        return $json_err->($c, 400, 'Ungueltiger Backup-Name')
-            unless $filename =~ /^\Q$base\E\.bak\.(\d{8}_\d{6}|\d{14}|\d+)$/;
+		return $json_err->($c, 400, 'Ungueltiger Backup-Name')
+			unless $filename =~ /^\Q$base\E\.bak\.(\d{8}_\d{6}|\d{14}|\d+)$/;
 
-        my $src  = "$bdir/$filename";
-        my $dest = $e->{path};
+		my $src  = "$bdir/$filename";
+		my $dest = $e->{path};
 
-        return $json_err->($c, 404, 'Backup nicht gefunden') unless -f $src;
-        return $json_err->($c, 400, 'Pfad nicht erlaubt') unless $is_allowed_path->($dest);
+		return $json_err->($c, 404, 'Backup nicht gefunden') unless -f $src;
+		return $json_err->($c, 400, 'Pfad nicht erlaubt')     unless $is_allowed_path->($dest);
 
-        path($src)->copy_to($dest) or return $json_err->($c, 500, "Wiederherstellung fehlgeschlagen: $!");
+		# 1) Backup lesen
+		my $raw = path($src)->slurp;
 
-        eval { $apply_meta->($e, $dest); 1 } or $log->warn("Fehler bei apply_meta: $@");
+		# 2) UTF-8 only: validieren + normalisieren auf UTF-8 Bytes
+		my $bytes;
+		my $ok_utf8 = eval {
+			$bytes = $require_valid_utf8->($raw);  # muss bei dir existieren
+			1;
+		};
+		return $json_err->($c, 415, 'Backup ist nicht UTF-8 kodiert') unless $ok_utf8;
 
-        my $applied_mode = $mode_str->($dest);
-        my ($uid, $gid)  = ((stat($dest))[4], (stat($dest))[5]);
+		# 3) Restore atomar schreiben (statt copy_to)
+		my $method;
+		my $ok_write = eval {
+			$method = $safe_write_file->($dest, $bytes);       # muss bei dir existieren
+			1;
+		};
+		return $json_err->($c, 500, "Wiederherstellung fehlgeschlagen: $@") unless $ok_write;
 
-        my $meta_wanted = defined $e->{apply_meta}
-            ? $e->{apply_meta}
-            : ($apply_meta_enabled || defined($e->{user}) || defined($e->{group}) || defined($e->{mode}));
+		# 4) Meta anwenden (owner/group/mode)
+		eval { $apply_meta->($e, $dest); 1 } or $log->warn("Fehler bei apply_meta: $@");
 
-        $c->render(json => {
-            ok       => 1,
-            restored => $name,
-            from     => $filename,
-            requested => {
-                user       => $e->{user},
-                group      => $e->{group},
-                mode       => $e->{mode},
-                apply_meta => ($meta_wanted ? Mojo::JSON::true : Mojo::JSON::false),
-            },
-            applied => { uid => $uid, gid => $gid, mode => $applied_mode }
-        });
-    };
+		my $applied_mode = $mode_str->($dest);
+		my ($uid, $gid)  = ((stat($dest))[4], (stat($dest))[5]);
+
+		my $meta_wanted = defined $e->{apply_meta}
+			? $e->{apply_meta}
+			: ($apply_meta_enabled || defined($e->{user}) || defined($e->{group}) || defined($e->{mode}));
+
+		$c->render(json => {
+			ok       => 1,
+			restored => $name,
+			from     => $filename,
+			method   => ($method // 'unknown'),
+			requested => {
+				user       => $e->{user},
+				group      => $e->{group},
+				mode       => $e->{mode},
+				apply_meta => ($meta_wanted ? Mojo::JSON::true : Mojo::JSON::false),
+			},
+			applied => { uid => $uid, gid => $gid, mode => $applied_mode }
+		});
+	};
+
 
     post '/action/*name/*cmd' => sub {
         my $c = shift;
