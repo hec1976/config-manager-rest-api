@@ -6,7 +6,7 @@ use Mojolicious::Lite;
 use Mojo::Log;
 use Mojo::File qw(path);
 use Mojo::Promise;
-use Mojo::Util qw(secure_compare steady_time);
+use Mojo::Util qw(secure_compare steady_time encode decode);
 use Mojo::JSON qw(decode_json encode_json);
 use Mojo::Date;
 
@@ -233,14 +233,19 @@ use POSIX qw(setpgid);
         return (length($ts) >= 14) ? (substr($ts, 0, 8) . "_" . substr($ts, 8, 6)) : $ts;
     };
 
-    my $write_atomic = sub {
-        my ($p, $bytes) = @_;
-        my $file = path($p);
-        my $tmp  = $file->dirname->child(".tmp_" . $file->basename . ".$$");
-        $tmp->spew($bytes);
-        $tmp->move_to($file);
-        return 'atomic';
-    };
+	my $write_atomic = sub {
+		my ($p, $bytes) = @_;
+		my $file = path($p);
+		my $tmp  = $file->dirname->child(".tmp_" . $file->basename . ".$$");
+
+		# NEU: Falls Perl die Daten intern als Unicode-String hält, 
+		# wandle sie hier explizit in UTF-8 Bytes um:
+		utf8::encode($bytes) if utf8::is_utf8($bytes);
+
+		$tmp->spew($bytes);
+		$tmp->move_to($file);
+		return 'atomic';
+	};
 
     my $safe_write_file = sub {
         my ($p, $bytes) = @_;
@@ -540,7 +545,10 @@ use POSIX qw(setpgid);
         return $json_err->($c, 404, "Datei fehlt: $p") unless -f $p;
 
         $c->res->headers->content_type('application/octet-stream');
-        $c->render(data => path($p)->slurp);
+        my $data = path($p)->slurp;
+		# Wir stellen sicher, dass es für den Transport als UTF-8 markiert ist
+		$data = decode('UTF-8', $data) if !utf8::is_utf8($data);
+		$c->render(data => encode('UTF-8', $data));
     };
 
     post '/config/*name' => sub {
@@ -642,7 +650,10 @@ use POSIX qw(setpgid);
         my $file = "$bdir/$filename";
         return $json_err->($c, 404, 'Backup nicht gefunden') unless -f $file;
 
-        $c->render(json => { ok => 1, content => path($file)->slurp });
+        my $raw_content = path($file)->slurp;
+		# Versuche UTF-8, falls das fehlschlägt, nimm Latin-1 (ISO-8859-1)
+		my $decoded_content = eval { decode('UTF-8', $raw_content) } // decode('cp1252', $raw_content);
+		$c->render(json => { ok => 1, content => $decoded_content });
     };
 
     post '/restore/*name/*filename' => sub {
