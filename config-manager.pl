@@ -150,7 +150,6 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
 		return secure_compare($calc, $hash) ? 1 : 0;
 	};
 
-
     my $bad_name = sub {
         my ($s) = @_;
         return 1 unless defined $s;
@@ -280,6 +279,18 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         $v //= '';
         return utf8::is_utf8($v) ? encode('UTF-8', $v) : $v;
     };
+
+	my $require_valid_utf8 = sub {
+		my ($v) = @_;
+		$v //= '';
+
+		my $bytes = utf8::is_utf8($v) ? encode('UTF-8', $v) : $v;
+
+		my $txt = eval { decode('UTF-8', $bytes, 1) };
+		die "Ungueltiges UTF-8 im Request" if $@;
+
+		return encode('UTF-8', $txt);
+	};	
 
     my $write_atomic = sub {
         my ($p, $bytes) = @_;
@@ -614,6 +625,9 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
             }
         }
 
+		eval { $content = $require_valid_utf8->($content); 1 }
+			or return $json_err->($c, 415, "Ungueltiges UTF-8");		
+
         my $bdir = $e->{backup_dir};
         if (!-d $bdir) {
             if ($auto_create_backups) { $ensure_dir->($bdir, 0750); }
@@ -896,6 +910,9 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
     post '/raw/configs' => sub {
         my $c = shift;
         my $raw = $c->req->body // '';
+
+		eval { $raw = $require_valid_utf8->($raw); 1 }
+			or return $json_err->($c, 415, "Ungueltiges UTF-8");		
 
         eval { decode_json($raw); 1 } or return $json_err->($c, 400, 'Ungueltiges JSON');
 
