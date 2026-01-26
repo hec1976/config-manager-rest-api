@@ -65,6 +65,34 @@ Sicherheit ist kein Add-on, sondern Grundannahme:
 
 Alle sicherheitsrelevanten Ereignisse werden geloggt.
 
+**API Auth (Perl Agent) – Kurznotiz**
+
+Der Config-Manager (Mojolicious/Perl) akzeptiert den API Token entweder als Header oder als Bearer Token:
+
+- Header: `X-API-Token: <token>`
+- Authorization: `Authorization: Bearer <token>`
+
+**Token-Formate**
+
+Der Agent unterstuetzt zwei Varianten:
+
+1) **Plain Token**  
+Im `global.json` oder via ENV `API_TOKEN` als Klartext.  
+Vergleich erfolgt mit `secure_compare()` (Timing-sicher).
+
+2) **Bcrypt Token (empfohlen)**  
+Wenn `api_token` im Format `$2a$...`, `$2y$...` oder `$2b$...` vorliegt, wird der empfangene Token gegen den gespeicherten Bcrypt-Hash verifiziert.
+
+Wichtig: Zur Kompatibilitaet mit PHP (`password_hash()` liefert oft `$2y$`) wird intern fuer die Berechnung auf `$2a$` normalisiert und danach wieder gegen den Original-Prefix (`$2y$`/`$2b$`) verglichen. So funktionieren PHP-Hashes sauber auch im Perl-Agent.
+
+**Beispiel curl**
+
+~~~bash
+curl -H "X-API-Token: <token>" http://127.0.0.1:3000/health
+# oder
+curl -H "Authorization: Bearer <token>" http://127.0.0.1:3000/health
+
+~~~
 ---
 
 ## Vergleich: Config-Manager max 10-20 Server vs. andere Lösungen
