@@ -567,29 +567,28 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         $c->render(json => { ok => 1, name => 'config-manager', version => $VERSION, api_endpoints => \@routes_list });
     };
 
-    get '/config/*name' => sub {
-        my $c = shift;
-        my $name = $c->stash('name');
+	get '/config/*name' => sub {
+		my $c = shift;
+		my $name = $c->stash('name');
 
-        return $json_err->($c, 400, 'Ungueltiger Name') if $bad_name->($name);
+		return $json_err->($c, 400, 'Ungueltiger Name') if $bad_name->($name);
 
-        my $e = $cfgmap{$name} or return $json_err->($c, 404, "Unbekannt: $name");
-        my $p = $e->{path};
+		my $e = $cfgmap{$name} or return $json_err->($c, 404, "Unbekannt: $name");
+		my $p = $e->{path};
 
-        return $json_err->($c, 400, "Pfad nicht erlaubt") unless $is_allowed_path->($p);
-        return $json_err->($c, 404, "Datei fehlt: $p") unless -f $p;
+		return $json_err->($c, 400, "Pfad nicht erlaubt") unless $is_allowed_path->($p);
+		return $json_err->($c, 404, "Datei fehlt: $p") unless -f $p;
 
-        my $raw = path($p)->slurp;
+		my $raw = path($p)->slurp;
 
-        # UTF-8 only: wenn Datei nicht gueltig UTF-8 ist -> 415
-        my $out = eval { $require_valid_utf8->($raw) };
-        if ($@) {
-            return $json_err->($c, 415, 'Datei ist nicht UTF-8 kodiert');
-        }
+		my $out = eval { $require_valid_utf8->($raw) };
+		if ($@) {
+			return $json_err->($c, 415, 'Datei ist nicht UTF-8 kodiert');
+		}
 
-        $c->res->headers->content_type('text/plain; charset=utf-8');
-        $c->render(data => $out);
-    };
+		$c->res->headers->content_type('text/plain; charset=utf-8');
+		$c->render(data => $out);
+	};
 
 
     get '/config/*name' => sub {
@@ -742,26 +741,22 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
 		return $json_err->($c, 404, 'Backup nicht gefunden') unless -f $src;
 		return $json_err->($c, 400, 'Pfad nicht erlaubt')     unless $is_allowed_path->($dest);
 
-		# 1) Backup lesen
 		my $raw = path($src)->slurp;
 
-		# 2) UTF-8 only: validieren + normalisieren auf UTF-8 Bytes
 		my $bytes;
 		my $ok_utf8 = eval {
-			$bytes = $require_valid_utf8->($raw);  # muss bei dir existieren
+			$bytes = $require_valid_utf8->($raw);
 			1;
 		};
 		return $json_err->($c, 415, 'Backup ist nicht UTF-8 kodiert') unless $ok_utf8;
 
-		# 3) Restore atomar schreiben (statt copy_to)
 		my $method;
 		my $ok_write = eval {
-			$method = $safe_write_file->($dest, $bytes);       # muss bei dir existieren
+			$method = $safe_write_file->($dest, $bytes);
 			1;
 		};
 		return $json_err->($c, 500, "Wiederherstellung fehlgeschlagen: $@") unless $ok_write;
 
-		# 4) Meta anwenden (owner/group/mode)
 		eval { $apply_meta->($e, $dest); 1 } or $log->warn("Fehler bei apply_meta: $@");
 
 		my $applied_mode = $mode_str->($dest);
@@ -785,6 +780,7 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
 			applied => { uid => $uid, gid => $gid, mode => $applied_mode }
 		});
 	};
+
 
 
     post '/action/*name/*cmd' => sub {
