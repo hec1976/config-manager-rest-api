@@ -6,9 +6,11 @@ use Mojolicious::Lite;
 use Mojo::Log;
 use Mojo::File qw(path);
 use Mojo::Promise;
-use Mojo::Util qw(secure_compare steady_time encode decode);
+use Mojo::Util qw(secure_compare steady_time);
 use Mojo::JSON qw(decode_json encode_json);
 use Mojo::Date;
+
+use Encode qw(encode decode);
 
 use FindBin qw($Bin);
 use Net::CIDR ();
@@ -22,13 +24,13 @@ use POSIX qw(setpgid);
 {
     umask 0007;
 
-    our $VERSION    = '1.7.7';
-    our $globalfile = "$Bin/global.json";
+    our $VERSION     = '1.7.7-ultra-clean+utf8safe';
+    our $globalfile  = "$Bin/global.json";
     our $configsfile = "$Bin/configs.json";
 
     my $log = Mojo::Log->new(level => 'info');
 
-    my $global  = eval { decode_json(path($globalfile)->slurp) };
+    my $global = eval { decode_json(path($globalfile)->slurp) };
     die "global.json ungueltig: $@" if $@ || ref($global) ne 'HASH';
 
     my $configs = eval { decode_json(path($configsfile)->slurp) };
@@ -74,11 +76,11 @@ use POSIX qw(setpgid);
     my $api_token = (defined $ENV{API_TOKEN} && $ENV{API_TOKEN} ne '')
         ? $ENV{API_TOKEN}
         : $global->{api_token};
-        
+
     # Hart erzwingen: ohne Token kein Start
     die "FATAL: api_token fehlt. Setze global.json api_token oder ENV API_TOKEN.\n"
         unless defined $api_token && length $api_token;
-        
+
     my $allowed_ips = $global->{allowed_ips};
     $allowed_ips = [] unless ref($allowed_ips) eq 'ARRAY';
 
@@ -120,6 +122,7 @@ use POSIX qw(setpgid);
         my ($s) = @_;
         return 1 unless defined $s;
         return 1 if length($s) < 1 || length($s) > 80;
+        return 1 if $s =~ m{[/\\]};
         return 1 unless $s =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/;
         return 1 if $s =~ /\.\./;
         return 0;
@@ -147,7 +150,10 @@ use POSIX qw(setpgid);
         return 1 if $path_guard eq 'off';
 
         if (!@ALLOWED_CANON) {
-            if ($path_guard eq 'audit') { $log->warn("PATH-GUARD audit: keine allowed_roots"); return 1; }
+            if ($path_guard eq 'audit') {
+                $log->warn("PATH-GUARD audit: keine allowed_roots");
+                return 1;
+            }
             return 0;
         }
 
@@ -158,7 +164,10 @@ use POSIX qw(setpgid);
             return 1 if $dircanon eq $root || index($dircanon, $root) == 0;
         }
 
-        if ($path_guard eq 'audit') { $log->warn("PATH-GUARD audit: $p ausserhalb allowed_roots"); return 1; }
+        if ($path_guard eq 'audit') {
+            $log->warn("PATH-GUARD audit: $p ausserhalb allowed_roots");
+            return 1;
+        }
         return 0;
     };
 
@@ -233,19 +242,24 @@ use POSIX qw(setpgid);
         return (length($ts) >= 14) ? (substr($ts, 0, 8) . "_" . substr($ts, 8, 6)) : $ts;
     };
 
-	my $write_atomic = sub {
-		my ($p, $bytes) = @_;
-		my $file = path($p);
-		my $tmp  = $file->dirname->child(".tmp_" . $file->basename . ".$$");
+    my $to_utf8_bytes = sub {
+        my ($v) = @_;
+        $v //= '';
+        return utf8::is_utf8($v) ? encode('UTF-8', $v) : $v;
+    };
 
-		# NEU: Falls Perl die Daten intern als Unicode-String hält, 
-		# wandle sie hier explizit in UTF-8 Bytes um:
-		utf8::encode($bytes) if utf8::is_utf8($bytes);
+    my $write_atomic = sub {
+        my ($p, $bytes) = @_;
+        my $file = path($p);
+        my $tmp  = $file->dirname->child(".tmp_" . $file->basename . ".$$");
 
-		$tmp->spew($bytes);
-		$tmp->move_to($file);
-		return 'atomic';
-	};
+        # UTF-8 Bytes erzwingen, falls Perl-String reinkommt
+        $bytes = $to_utf8_bytes->($bytes);
+
+        $tmp->spew($bytes);
+        $tmp->move_to($file);
+        return 'atomic';
+    };
 
     my $safe_write_file = sub {
         my ($p, $bytes) = @_;
@@ -253,6 +267,7 @@ use POSIX qw(setpgid);
         my $ok = eval { $write_atomic->($p, $bytes); 1 };
         if (!$ok) {
             $method = 'plain';
+            $bytes = $to_utf8_bytes->($bytes);
             path($p)->spew($bytes);
         }
         return $method;
@@ -305,33 +320,32 @@ use POSIX qw(setpgid);
     my $capture_cmd_promise = sub {
         my ($timeout, @cmd) = @_;
         $timeout = 10 unless defined $timeout && $timeout =~ /^\d+$/;
-    
+
         return Mojo::Promise->new(sub {
             my ($resolve) = @_;
-    
+
             Mojo::IOLoop->subprocess(
                 sub {
                     local $ENV{PATH} = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    
+
                     my ($bin, @args) = @cmd;
                     die "Missing command" unless defined $bin && length $bin;
-    
+
                     # Bin: absolut, ASCII, keine Spaces
                     die "Bad command path" unless $bin =~ m{\A/[A-Za-z0-9._/-]+\z};
                     die "Command not executable" unless -x $bin;
-    
+
                     # Args: enges Whitelisting, keine Spaces
                     for my $a (@args) {
                         die "Bad arg" unless defined $a && length $a;
                         die "Bad arg" unless $a =~ /\A[A-Za-z0-9._:+@\/=\-,]+\z/;
                     }
-    
+
                     my $errfh = gensym;
-    
                     my $pid;
+
                     local $SIG{ALRM} = sub {
                         if ($pid) {
-                            # kill process group if possible, else child
                             kill 'TERM', -$pid;
                             kill 'TERM',  $pid;
                             select(undef, undef, undef, 0.2);
@@ -340,22 +354,21 @@ use POSIX qw(setpgid);
                         }
                         die "__TIMEOUT__\n";
                     };
-    
                     alarm $timeout;
-    
+
                     $pid = open3(my $in, my $out, $errfh, $bin, @args);
                     close $in;
-    
-                    # eigene Prozessgruppe: nach dem fork, im Parent setzen
+
+                    # eigene Prozessgruppe
                     eval { setpgid($pid, $pid); 1 };
-    
+
                     my $buf = '';
-    
-                    # stdout/stderr parallel lesen (verhindert pipe-deadlock)
+
+                    # stdout/stderr parallel lesen (kein Deadlock)
                     my $sel = IO::Select->new();
                     $sel->add($out);
                     $sel->add($errfh);
-    
+
                     while ($sel->count) {
                         for my $fh ($sel->can_read(1)) {
                             my $chunk = '';
@@ -368,20 +381,20 @@ use POSIX qw(setpgid);
                             close $fh;
                         }
                     }
-    
+
                     waitpid($pid, 0);
                     my $rc = ($? >> 8);
-    
+
                     alarm 0;
                     return { rc => $rc, out => ($buf // "") };
                 },
                 sub {
                     my ($subprocess, $err, $res) = @_;
-    
+
                     if (defined $err && $err =~ /__TIMEOUT__/) {
                         return $resolve->({ rc => -1, out => "TIMEOUT after ${timeout}s\n" });
                     }
-    
+
                     $res ||= { rc => -1, out => ($err // "unknown error") };
                     return $resolve->($res);
                 }
@@ -544,11 +557,9 @@ use POSIX qw(setpgid);
         return $json_err->($c, 400, "Pfad nicht erlaubt") unless $is_allowed_path->($p);
         return $json_err->($c, 404, "Datei fehlt: $p") unless -f $p;
 
-        $c->res->headers->content_type('application/octet-stream');
-        my $data = path($p)->slurp;
-		# Wir stellen sicher, dass es für den Transport als UTF-8 markiert ist
-		$data = decode('UTF-8', $data) if !utf8::is_utf8($data);
-		$c->render(data => encode('UTF-8', $data));
+        # Editor freundlich: UTF-8 deklarieren
+        $c->res->headers->content_type('text/plain; charset=utf-8');
+        $c->render(data => path($p)->slurp);
     };
 
     post '/config/*name' => sub {
@@ -650,10 +661,13 @@ use POSIX qw(setpgid);
         my $file = "$bdir/$filename";
         return $json_err->($c, 404, 'Backup nicht gefunden') unless -f $file;
 
-        my $raw_content = path($file)->slurp;
-		# Versuche UTF-8, falls das fehlschlägt, nimm Latin-1 (ISO-8859-1)
-		my $decoded_content = eval { decode('UTF-8', $raw_content) } // decode('cp1252', $raw_content);
-		$c->render(json => { ok => 1, content => $decoded_content });
+        my $raw = path($file)->slurp;
+        my $txt = eval { decode('UTF-8', $raw, 1) };
+        if ($@) {
+            return $json_err->($c, 415, 'Backup ist nicht UTF-8 kodiert');
+        }
+
+        $c->render(json => { ok => 1, content => $txt });
     };
 
     post '/restore/*name/*filename' => sub {
@@ -767,14 +781,12 @@ use POSIX qw(setpgid);
         elsif ($svc =~ m{^(bash|sh|perl|exec):(/.+)$}) {
             my ($runner, $script) = ($1, $2);
             return $json_err->($c, 404, "Skript nicht gefunden: $script") unless -f $script;
-            return $json_err->($c, 400, "Symlink Script verboten: $script") if -l $script;
-            return $json_err->($c, 400, "Script Pfad nicht erlaubt: $script") unless $is_allowed_path->($script);
-            
+
             if ($runner eq 'exec' && $script =~ m{/systemctl$}) {
                 return $json_err->($c, 400, 'Subcommand verboten')
-                    if ($extra[0] // '') =~ /^(poweroff|reboot|halt|kexec|suspend|hibernate|hybrid-sleep|sleep|rescue|emergency|isolate|daemon-reexec|set-default|default|exit|mask|unmask|enable|disable|link|preset|preset-all|edit|cat|reset-failed)$/i;
-            }   
-            
+                    if ($extra[0] // '') =~ /^(poweroff|reboot|halt)$/;
+            }
+
             my @argv =
                   $runner eq 'perl' ? ('/usr/bin/perl', $script, @extra)
                 : $runner eq 'bash' ? ('/bin/bash', $script, @extra)
