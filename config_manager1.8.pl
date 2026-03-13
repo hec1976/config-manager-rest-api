@@ -1,0 +1,1083 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+use Mojolicious::Lite;
+use Mojo::Log;
+use Mojo::File qw(path);
+use Mojo::Promise;
+use Mojo::Util qw(secure_compare steady_time);
+use Mojo::JSON qw(decode_json encode_json);
+use Mojo::Date;
+
+use Encode qw(encode decode);
+
+use FindBin qw($Bin);
+use Net::CIDR ();
+use Text::ParseWords qw(shellwords);
+
+use IPC::Open3;
+use Symbol qw(gensym);
+use IO::Select ();
+use POSIX qw(setpgid);
+use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
+
+
+{
+    umask 0007;
+
+    our $VERSION     = '1.8.0-hardened';
+    our $globalfile  = "$Bin/global.json";
+    our $configsfile = "$Bin/configs.json";
+
+    my $log = Mojo::Log->new(level => 'info');
+
+    my $global = eval { decode_json(path($globalfile)->slurp) };
+    die "global.json ungueltig: $@" if $@ || ref($global) ne 'HASH';
+
+    my $configs = eval { decode_json(path($configsfile)->slurp) };
+    die "configs.json ungueltig: $@" if $@ || ref($configs) ne 'HASH';
+
+    my $SYSTEMCTL = (defined $global->{systemctl} && $global->{systemctl} ne '')
+        ? $global->{systemctl}
+        : '/usr/bin/systemctl';
+
+    my $SYSTEMCTL_FLAGS = exists $ENV{SYSTEMCTL_FLAGS}
+        ? $ENV{SYSTEMCTL_FLAGS}
+        : ($global->{systemctl_flags} // '');
+
+    my @SYSTEMCTL_BASE = ($SYSTEMCTL);
+    if (defined $SYSTEMCTL_FLAGS && length $SYSTEMCTL_FLAGS) {
+        my @f = shellwords($SYSTEMCTL_FLAGS);
+        push @SYSTEMCTL_BASE, @f if @f;
+    }
+
+    # Logging Datei (optional)
+    my $logfile = $global->{logfile} // "/var/log/config-manager.log";
+    my $logdir  = path($logfile)->dirname;
+    if (!-d $logdir) {
+        eval { $logdir->make_path; 1 };
+        chmod 0755, $logdir->to_string if -d $logdir->to_string;
+    }
+    if (-d $logdir) {
+        $log->path($logfile);
+        $log->info("Logging in Datei $logfile aktiviert.");
+    } else {
+        $log->warn("Konnte Log-Verzeichnis $logdir nicht nutzen. Logging auf STDERR.");
+    }
+
+    # Mojolicious secrets
+    my $sec = $global->{secret};
+    my @secrets = ref($sec) eq 'ARRAY' ? @$sec : ($sec // 'change-this-long-random-secret-please');
+    app->secrets(\@secrets);
+    if (grep { defined($_) && $_ eq 'change-this-long-random-secret-please' } @secrets) {
+        $log->warn('[config-manager] WARNING: Standard-Mojolicious Secret wird verwendet! Bitte in global.json anpassen.');
+    }
+
+    # Security / Settings
+    my $api_token = (defined $ENV{API_TOKEN} && $ENV{API_TOKEN} ne '')
+        ? $ENV{API_TOKEN}
+        : $global->{api_token};
+
+    # Hart erzwingen: ohne Token kein Start
+    die "FATAL: api_token fehlt. Setze global.json api_token oder ENV API_TOKEN.\n"
+        unless defined $api_token && length $api_token;
+
+    my $allowed_ips = $global->{allowed_ips};
+    $allowed_ips = [] unless ref($allowed_ips) eq 'ARRAY';
+
+    my $backupRoot = $global->{backupDir} // "$Bin/backup";
+    my $tmpDir     = $global->{tmpDir}    // "$Bin/tmp";
+
+    eval { path($backupRoot)->make_path; 1 } or die "Backup-Verzeichnis $backupRoot fehlt/nicht erstellbar";
+    chmod 0750, $backupRoot if -d $backupRoot;
+
+    eval { path($tmpDir)->make_path; 1 } or die "Tmp-Verzeichnis $tmpDir fehlt/nicht erstellbar";
+    chmod 0750, $tmpDir if -d $tmpDir;
+
+    my $maxBackups          = $global->{maxBackups} // 10;
+
+    # FIX #1: path_guard Default auf 'enforce' statt 'off'
+    # Vorher: my $path_guard = lc($ENV{PATH_GUARD} // ($global->{path_guard} // 'off'));
+    my $path_guard          = lc($ENV{PATH_GUARD} // ($global->{path_guard} // 'enforce'));
+
+    my $apply_meta_enabled  = $global->{apply_meta} // 0;
+    my $auto_create_backups = $global->{auto_create_backups} // 0;
+
+    # Allowed roots canonical
+    my @ALLOWED_CANON;
+    if (ref($global->{allowed_roots}) eq 'ARRAY') {
+        my %seen;
+        for my $r (@{$global->{allowed_roots}}) {
+            my $rp = path($r)->realpath;
+            next unless defined $rp && length $rp;
+            $rp =~ s{/*$}{};
+            $rp .= '/';
+            next if $seen{$rp}++;
+            push @ALLOWED_CANON, $rp;
+        }
+    }
+    $log->info(@ALLOWED_CANON ? ('ALLOWED_ROOTS=' . join(',', @ALLOWED_CANON)) : 'ALLOWED_ROOTS=(leer)');
+
+    my %TRUSTED = map { $_ => 1 } (ref($global->{trusted_proxies}) eq 'ARRAY' ? @{$global->{trusted_proxies}} : ());
+
+    # FIX #4: CORS restriktiver - nur explizit definierte Origins erlauben.
+    # Vorher: leere allow_origins => Origin einfach spiegeln (jede Origin erlaubt).
+    # Jetzt:  leere allow_origins => kein CORS-Header (kein Wildcard-Spiegeln).
+    my %ALLOW_ORIGIN = map { $_ => 1 } (ref($global->{allow_origins}) eq 'ARRAY' ? @{$global->{allow_origins}} : ());
+
+    # NOTE (global.json): global.json wird nur beim Start geladen.
+    # Aenderungen an allowed_ips, allow_origins, api_token etc. erfordern einen Neustart.
+    # configs.json kann per /raw/configs/reload zur Laufzeit neu geladen werden.
+
+    # ---------------- helpers ----------------
+
+    # Hilfsfunktion fuer Bcrypt-Verifizierung (kompatibel zu PHP password_hash)
+    # HINWEIS: Dieser Block ist sicherheitskritisch.
+    # Getestet werden sollte: $2y$, $2b$, falsches Passwort, Sonderzeichen im Token, sehr lange Tokens.
+    my $verify_bcrypt = sub {
+        my ($plain, $hash) = @_;
+        return 0 unless defined $plain && defined $hash;
+
+        # Akzeptiere $2a$, $2y$, $2b$ und exakt 60 Zeichen Format
+        return 0 unless $hash =~ /^\$2[aby]\$\d{2}\$[\.\/A-Za-z0-9]{53}$/;
+
+        # Perl-Modul kann je nach Build zickig sein mit 2y/2b, darum auf 2a normalisieren
+        my $perl_safe_hash = $hash;
+        $perl_safe_hash =~ s/^\$2[yb]\$/\$2a\$/;
+
+        # settings: "$2a$10$<22salt>" (29 chars)
+        my $settings = substr($perl_safe_hash, 0, 29);
+        return 0 unless length($settings) == 29;
+
+        my $calc;
+        my $ok = eval {
+            $calc = bcrypt($plain, $settings);
+            1;
+        };
+        return 0 unless $ok && defined $calc && length $calc;
+
+        # calc wieder auf original prefix bringen, dann compare gegen original hash
+        $calc =~ s/^\$2a\$/\$2y\$/ if $hash =~ /^\$2y\$/;
+        $calc =~ s/^\$2a\$/\$2b\$/ if $hash =~ /^\$2b\$/;
+
+        return secure_compare($calc, $hash) ? 1 : 0;
+    };
+
+    # --- Helper: UTF-8 Validierung + Normalisierung ---
+    my $require_valid_utf8 = sub {
+        my ($v) = @_;
+        $v //= '';
+
+        my $bytes = utf8::is_utf8($v) ? encode('UTF-8', $v) : $v;
+
+        my $txt = decode('UTF-8', $bytes, 1);
+        die "Ungueltiges UTF-8 im Request" unless defined $txt;
+
+        return encode('UTF-8', $txt);
+    };
+
+    my $bad_name = sub {
+        my ($s) = @_;
+        return 1 unless defined $s;
+        return 1 if length($s) < 1 || length($s) > 80;
+        return 1 if $s =~ m{[/\\]};
+        return 1 unless $s =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/;
+        return 1 if $s =~ /\.\./;
+        return 0;
+    };
+
+    # FIX #8: Separate, streng formatierte Validierung fuer Backup-Dateinamen.
+    # Vorher: bad_name() mit Limit 80 - zu eng und fuer Backupnamen ungeeignet.
+    # Jetzt: Eigene Sub, die nur das exakte Backup-Format akzeptiert.
+    my $bad_backup_filename = sub {
+        my ($base, $filename) = @_;
+        return 1 unless defined $base && defined $filename;
+        # Exaktes Format: <base>.bak.<YYYYMMDD_HHMMSS>
+        return 0 if $filename =~ /^\Q$base\E\.bak\.(\d{8}_\d{6}|\d{14}|\d+)$/;
+        return 1;
+    };
+
+    my $json_err = sub {
+        my ($c, $code, $msg) = @_;
+        $code ||= 400;
+        return $c->render(status => $code, json => { ok => 0, error => $msg });
+    };
+
+    my $canon_dir_of_path = sub {
+        my ($p) = @_;
+        return undef unless defined $p && length $p;
+        my $rp = -e $p ? path($p)->realpath : path($p)->dirname->realpath;
+        return undef unless defined $rp && length $rp;
+        $rp =~ s{/*$}{};
+        $rp .= '/';
+        return $rp;
+    };
+
+    my $is_allowed_path = sub {
+        my ($p) = @_;
+        return 0 if -l $p;
+        return 1 if $path_guard eq 'off';
+
+        if (!@ALLOWED_CANON) {
+            if ($path_guard eq 'audit') {
+                $log->warn("PATH-GUARD audit: keine allowed_roots");
+                return 1;
+            }
+            return 0;
+        }
+
+        my $dircanon = $canon_dir_of_path->($p);
+        return 0 unless $dircanon;
+
+        for my $root (@ALLOWED_CANON) {
+            return 1 if $dircanon eq $root || index($dircanon, $root) == 0;
+        }
+
+        if ($path_guard eq 'audit') {
+            $log->warn("PATH-GUARD audit: $p ausserhalb allowed_roots");
+            return 1;
+        }
+        return 0;
+    };
+
+    my $mode_str = sub {
+        my ($p) = @_;
+        return undef unless -e $p;
+        return sprintf('%04o', (stat($p))[2] & 07777);
+    };
+
+    my $name2uid = sub {
+        my ($n) = @_;
+        return undef unless defined $n && length $n;
+        return $n =~ /^\d+$/ ? 0 + $n : scalar((getpwnam($n))[2]);
+    };
+    my $name2gid = sub {
+        my ($n) = @_;
+        return undef unless defined $n && length $n;
+        return $n =~ /^\d+$/ ? 0 + $n : scalar((getgrnam($n))[2]);
+    };
+
+    my $apply_meta = sub {
+        my ($e, $p) = @_;
+
+        my $auto_wanted = (defined $e->{user} || defined $e->{group} || defined $e->{mode}) ? 1 : 0;
+        my $enabled = defined $e->{apply_meta} ? $e->{apply_meta} : ($apply_meta_enabled || $auto_wanted);
+        return unless $enabled;
+
+        die "Pfad nicht erlaubt" unless $is_allowed_path->($p);
+        die "Symlinks werden abgelehnt" if -l $p;
+
+        my $uid = $name2uid->($e->{user});
+        my $gid = $name2gid->($e->{group});
+
+        my $mode;
+        if (defined $e->{mode}) {
+            my $m = "$e->{mode}";
+            $m =~ s/^0+//;
+            die "Ungueltiger Modus: $e->{mode}" unless $m =~ /^[0-7]{3,4}$/;
+            $mode = oct($m);
+        }
+
+        if (defined $uid || defined $gid) {
+            my $u = defined($uid) ? $uid : -1;
+            my $g = defined($gid) ? $gid : -1;
+            chown($u, $g, $p) or die "chown fehlgeschlagen: $!";
+        }
+        chmod($mode, $p) if defined $mode;
+        return 1;
+    };
+
+    my $backup_dir_for = sub {
+        my ($name) = @_;
+        my $sub = $name // '';
+        $sub =~ s{[^A-Za-z0-9._-]+}{_}g;
+        return "$backupRoot/$sub";
+    };
+
+    my $ensure_dir = sub {
+        my ($dir, $mode) = @_;
+        return 1 if -d $dir;
+        eval { path($dir)->make_path; 1 } or return;
+        chmod($mode, $dir) if -d $dir && defined $mode;
+        return -d $dir ? 1 : 0;
+    };
+
+    my $ts_compact = sub {
+        my $ts = Mojo::Date->new->to_datetime;
+        if ($ts =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/) {
+            return "$1$2$3\_$4$5$6";
+        }
+        $ts =~ s/[^0-9]//g;
+        return (length($ts) >= 14) ? (substr($ts, 0, 8) . "_" . substr($ts, 8, 6)) : $ts;
+    };
+
+    my $to_utf8_bytes = sub {
+        my ($v) = @_;
+        $v //= '';
+        return utf8::is_utf8($v) ? encode('UTF-8', $v) : $v;
+    };
+
+    my $write_atomic = sub {
+        my ($p, $bytes) = @_;
+        my $file = path($p);
+        my $tmp  = $file->dirname->child(".tmp_" . $file->basename . ".$$");
+
+        # UTF-8 Bytes erzwingen, falls Perl-String reinkommt
+        $bytes = $to_utf8_bytes->($bytes);
+
+        $tmp->spew($bytes);
+        $tmp->move_to($file);
+        return 'atomic';
+    };
+
+    # FIX #6: safe_write_file() kein stiller Fallback mehr auf plain write.
+    # Vorher: bei atomic-Fehler => plain write (stille Degradierung).
+    # Jetzt: atomic oder Fehler. Kein Fallback fuer kritische Configs.
+    my $safe_write_file = sub {
+        my ($p, $bytes) = @_;
+        $write_atomic->($p, $bytes);
+        return 'atomic';
+    };
+
+    my $systemctl_promise = sub {
+        my ($timeout, @cmd) = @_;
+        $timeout = 30 unless defined $timeout && $timeout =~ /^\d+$/;
+
+        return Mojo::Promise->new(sub {
+            my ($resolve, $reject) = @_;
+
+            Mojo::IOLoop->subprocess(
+                sub {
+                    local $SIG{ALRM} = sub { die "__TIMEOUT__\n" };
+                    alarm $timeout;
+
+                    open(STDIN, '<', '/dev/null') or die "open /dev/null: $!";
+                    system @cmd;
+
+                    alarm 0;
+                    return $?;
+                },
+                sub {
+                    my ($subprocess, $err, $raw_rc) = @_;
+
+                    if (defined $err && length $err) {
+                        if ($err =~ /__TIMEOUT__/) {
+                            $log->warn("systemctl Timeout nach ${timeout}s: @cmd");
+                            return $resolve->(-1);
+                        }
+                        $log->error("systemctl Subprocess Fehler: $err cmd=@cmd");
+                        return $reject->($err);
+                    }
+
+                    $raw_rc //= 0;
+
+                    if (($raw_rc & 127) > 0) {
+                        my $sig = $raw_rc & 127;
+                        $log->warn("systemctl mit Signal $sig beendet: @cmd");
+                        return $resolve->(128 + $sig);
+                    }
+
+                    return $resolve->($raw_rc >> 8);
+                }
+            );
+        });
+    };
+
+    my $capture_cmd_promise = sub {
+        my ($timeout, @cmd) = @_;
+        $timeout = 10 unless defined $timeout && $timeout =~ /^\d+$/;
+
+        return Mojo::Promise->new(sub {
+            my ($resolve) = @_;
+
+            Mojo::IOLoop->subprocess(
+                sub {
+                    local $ENV{PATH} = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+                    my ($bin, @args) = @cmd;
+                    die "Missing command" unless defined $bin && length $bin;
+
+                    # Bin: absolut, ASCII, keine Spaces
+                    die "Bad command path" unless $bin =~ m{\A/[A-Za-z0-9._/-]+\z};
+                    die "Command not executable" unless -x $bin;
+
+                    # Args: enges Whitelisting, keine Spaces
+                    for my $a (@args) {
+                        die "Bad arg" unless defined $a && length $a;
+                        die "Bad arg" unless $a =~ /\A[A-Za-z0-9._:+@\/=\-,]+\z/;
+                    }
+
+                    my $errfh = gensym;
+                    my $pid;
+
+                    local $SIG{ALRM} = sub {
+                        if ($pid) {
+                            kill 'TERM', -$pid;
+                            kill 'TERM',  $pid;
+                            select(undef, undef, undef, 0.2);
+                            kill 'KILL', -$pid;
+                            kill 'KILL',  $pid;
+                        }
+                        die "__TIMEOUT__\n";
+                    };
+                    alarm $timeout;
+
+                    $pid = open3(my $in, my $out, $errfh, $bin, @args);
+                    close $in;
+
+                    # eigene Prozessgruppe
+                    eval { setpgid($pid, $pid); 1 };
+
+                    my $buf = '';
+
+                    # stdout/stderr parallel lesen (kein Deadlock)
+                    my $sel = IO::Select->new();
+                    $sel->add($out);
+                    $sel->add($errfh);
+
+                    while ($sel->count) {
+                        for my $fh ($sel->can_read(1)) {
+                            my $chunk = '';
+                            my $r = sysread($fh, $chunk, 8192);
+                            if ($r) {
+                                $buf .= $chunk;
+                                next;
+                            }
+                            $sel->remove($fh);
+                            close $fh;
+                        }
+                    }
+
+                    waitpid($pid, 0);
+                    my $rc = ($? >> 8);
+
+                    alarm 0;
+                    return { rc => $rc, out => ($buf // "") };
+                },
+                sub {
+                    my ($subprocess, $err, $res) = @_;
+
+                    if (defined $err && $err =~ /__TIMEOUT__/) {
+                        return $resolve->({ rc => -1, out => "TIMEOUT after ${timeout}s\n" });
+                    }
+
+                    $res ||= { rc => -1, out => ($err // "unknown error") };
+                    return $resolve->($res);
+                }
+            );
+        });
+    };
+
+    my $parse_postmulti_status = sub {
+        my ($stdout, $stderr, $rc) = @_;
+        my $txt = lc(($stdout // "") . ($stderr // ""));
+
+        return "running" if $txt =~ /is\s+running/
+            || $txt =~ /pid:\s*\d+/
+            || $txt =~ /[\w\-\.\/]+:\s*(the\s+postfix\s+mail\s+system\s+is\s+)?running/;
+
+        return "stopped" if $txt =~ /not\s+running/
+            || $txt =~ /inactive/
+            || $txt =~ /stopped/
+            || $txt =~ /[\w\-\.\/]+:\s*not\s+running/;
+
+        return "running" if $rc == 0;
+        return "stopped" if $rc == 1;
+        return "unknown";
+    };
+
+    my $client_ip = sub {
+        my ($c) = @_;
+        my $rip = $c->tx->remote_address // '';
+        if ($TRUSTED{$rip}) {
+            my $xff = $c->req->headers->header('X-Forwarded-For') // '';
+            if ($xff) {
+                my @ips = map { s/^\s+|\s+$//gr } split /,/, $xff;
+                return $ips[0] // $rip;
+            }
+        }
+        return $rip;
+    };
+
+    my $fmt_req = sub {
+        my ($c) = @_;
+        return sprintf(
+            'req_id=%s ip=%s %s %s',
+            ($c->stash('req_id') // ''),
+            ($c->stash('client_ip') // ''),
+            ($c->req->method // ''),
+            ($c->req->url->path->to_string // '')
+        );
+    };
+
+    # ---------------- cfg map ----------------
+
+    my %cfgmap;
+
+    my $derive_actions = sub {
+        my ($entry) = @_;
+        my %actions;
+
+        if (ref($entry->{actions}) eq 'HASH') {
+            while (my ($k, $v) = each %{$entry->{actions}}) {
+                $actions{$k} = (ref($v) eq 'ARRAY') ? [@$v] : [];
+            }
+            return \%actions;
+        }
+
+        if (ref($entry->{commands}) eq 'HASH') {
+            while (my ($k, $v) = each %{$entry->{commands}}) {
+                $actions{$k} = (ref($v) eq 'ARRAY') ? [@$v] : [];
+            }
+            return \%actions;
+        }
+
+        if (ref($entry->{command_args}) eq 'HASH') {
+            my @tokens = ref($entry->{commands}) eq 'ARRAY' ? @{$entry->{commands}} : keys %{$entry->{command_args}};
+            for my $t (@tokens) {
+                my $arr = $entry->{command_args}{$t};
+                $actions{$t} = (ref($arr) eq 'ARRAY') ? [@$arr] : [];
+            }
+            return \%actions;
+        }
+
+        if (ref($entry->{commands}) eq 'ARRAY' && grep { $_ eq 'run' } @{$entry->{commands}}) {
+            $actions{run} = [];
+        }
+
+        return \%actions;
+    };
+
+    my $rebuild_cfgmap_from = sub {
+        my ($cfg) = @_;
+        %cfgmap = ();
+
+        while (my ($name, $entry) = each %{$cfg}) {
+            next if !defined $name || $name =~ m{[/\\]} || $name =~ m{\.\.};
+
+            my $actions = $derive_actions->($entry);
+
+            $cfgmap{$name} = {
+                %$entry,
+                id         => $name,
+                service    => $entry->{service}  // $name,
+                category   => $entry->{category} // 'uncategorized',
+                path       => $entry->{path},
+                actions    => $actions,
+                backup_dir => $backup_dir_for->($name),
+            };
+        }
+        return 1;
+    };
+
+    $rebuild_cfgmap_from->($configs);
+
+    # Helper: Backup des aktuellen Zielzustands erstellen (fuer Restore-Absicherung)
+    my $create_backup_of = sub {
+        my ($p, $bdir) = @_;
+        return unless -f $p;
+        my $ts    = $ts_compact->();
+        my $bfile = "$bdir/" . path($p)->basename . ".bak.$ts";
+        eval { path($p)->copy_to($bfile); 1 };
+        my $base = path($p)->basename;
+        my @b = sort { $b cmp $a } grep { defined } glob("$bdir/$base.bak.*");
+        if (@b > $maxBackups) { unlink @b[$maxBackups .. $#b]; }
+    };
+
+    # ---------------- routes ----------------
+
+    get '/' => sub {
+        my $c = shift;
+
+        my @routes_list;
+        for my $route (@{app->routes->children}) {
+            next unless ref $route;
+            my $methods = $route->via;
+            my $method_str = (ref($methods) eq 'ARRAY' && @$methods) ? join(', ', map { uc } @$methods) : 'ANY';
+            push @routes_list, { method => $method_str, path => $route->to_string };
+        }
+        @routes_list = sort { $a->{path} cmp $b->{path} } @routes_list;
+
+        $c->render(json => { ok => 1, name => 'config-manager', version => $VERSION, api_endpoints => \@routes_list });
+    };
+
+    get '/configs' => sub {
+        my $c = shift;
+        my @list;
+
+        for my $name (sort keys %cfgmap) {
+            my $e = $cfgmap{$name};
+            my $filename = path($e->{path})->basename;
+            my ($ext) = $filename =~ /\.([^.]+)$/;
+            my @tokens = sort keys %{$e->{actions} // {}};
+
+            push @list, {
+                id       => $name,
+                filename => $filename,
+                filetype => lc($ext // 'txt'),
+                category => $e->{category},
+                actions  => \@tokens
+            };
+        }
+
+        $c->render(json => { ok => 1, configs => \@list });
+    };
+
+    get '/config/*name' => sub {
+        my $c = shift;
+        my $name = $c->stash('name');
+
+        return $json_err->($c, 400, 'Ungueltiger Name') if $bad_name->($name);
+
+        my $e = $cfgmap{$name} or return $json_err->($c, 404, "Unbekannt: $name");
+        my $p = $e->{path};
+
+        return $json_err->($c, 400, "Pfad nicht erlaubt") unless $is_allowed_path->($p);
+        return $json_err->($c, 404, "Datei fehlt: $p") unless -f $p;
+
+        # FIX #5: UTF-8 Validierung beim Lesen - nur saubere UTF-8 Dateien als charset=utf-8 ausliefern.
+        # Vorher: Rohdaten slurpen und als UTF-8 deklarieren, ohne zu pruefen ob gueltig.
+        # Jetzt: Bytes lesen, UTF-8 validieren, bei Fehler 415 zurueckgeben.
+        my $raw = path($p)->slurp;
+        my $txt = eval { decode('UTF-8', $raw, 1) };
+        if ($@) {
+            return $json_err->($c, 415, "Datei ist nicht gueltig UTF-8 kodiert");
+        }
+
+        $c->res->headers->content_type('text/plain; charset=utf-8');
+        $c->render(data => $raw);
+    };
+
+    post '/config/*name' => sub {
+        my $c = shift;
+        my $name = $c->stash('name');
+
+        return $json_err->($c, 400, 'Ungueltiger Name') if $bad_name->($name);
+
+        my $e = $cfgmap{$name} or return $json_err->($c, 404, "Unbekannt: $name");
+        my $p = $e->{path};
+
+        return $json_err->($c, 400, "Pfad nicht erlaubt") unless $is_allowed_path->($p);
+
+        my $content = $c->req->body // '';
+        if (($c->req->headers->content_type // '') =~ m{application/json}i) {
+            my $j = eval { $c->req->json };
+            if (!$@ && ref($j) eq 'HASH' && exists $j->{content}) {
+                $content = $j->{content} // '';
+            }
+        }
+
+        eval { $content = $require_valid_utf8->($content); 1 }
+            or return $json_err->($c, 415, "Ungueltiges UTF-8");
+
+        my $bdir = $e->{backup_dir};
+        if (!-d $bdir) {
+            if ($auto_create_backups) { $ensure_dir->($bdir, 0750); }
+            return $json_err->($c, 500, "Backup-Verzeichnis fehlt") unless -d $bdir;
+        }
+
+        # Backup wenn Ziel existiert
+        $create_backup_of->($p, $bdir) if -f $p;
+
+        my $method;
+        eval { $method = $safe_write_file->($p, $content); 1 }
+            or return $json_err->($c, 500, "Schreibfehler: $@");
+
+        my $meta_wanted = defined $e->{apply_meta}
+            ? $e->{apply_meta}
+            : ($apply_meta_enabled || defined($e->{user}) || defined($e->{group}) || defined($e->{mode}));
+
+        eval { $apply_meta->($e, $p); 1 } or $log->warn("Fehler bei apply_meta: $@");
+
+        my $applied_mode = $mode_str->($p);
+        my ($uid, $gid)  = ((stat($p))[4], (stat($p))[5]);
+
+        $c->render(json => {
+            ok        => 1,
+            saved     => $name,
+            path      => $p,
+            method    => $method,
+            requested => {
+                user       => $e->{user},
+                group      => $e->{group},
+                mode       => $e->{mode},
+                apply_meta => ($meta_wanted ? Mojo::JSON::true : Mojo::JSON::false),
+            },
+            applied => { uid => $uid, gid => $gid, mode => $applied_mode }
+        });
+    };
+
+    get '/backups/*name' => sub {
+        my $c = shift;
+        my $name = $c->stash('name');
+
+        return $json_err->($c, 400, 'Ungueltiger Name') if $bad_name->($name);
+
+        my $e = $cfgmap{$name} or return $json_err->($c, 404, "Unbekannte Konfiguration: $name");
+        my $bdir = $e->{backup_dir};
+
+        return $c->render(json => { ok => 1, backups => [] }) unless -d $bdir;
+
+        my $base = path($e->{path})->basename;
+        my @files = sort { $b cmp $a } grep { defined } glob("$bdir/$base.bak.*");
+        @files = map { s{^\Q$bdir\E/}{}r } @files;
+
+        $c->render(json => { ok => 1, backups => \@files });
+    };
+
+    get '/backupcontent/*name/*filename' => sub {
+        my $c = shift;
+        my ($name, $filename) = ($c->stash('name'), $c->stash('filename'));
+
+        # FIX #8: bad_name() nur noch fuer 'name', eigene Validierung fuer 'filename'
+        return $json_err->($c, 400, 'Ungueltiger Name') if $bad_name->($name);
+
+        my $e = $cfgmap{$name} or return $json_err->($c, 404, "Unbekannte Konfiguration: $name");
+
+        my $bdir = $e->{backup_dir};
+        my $base = path($e->{path})->basename;
+
+        return $json_err->($c, 400, 'Ungueltiger Backup-Name')
+            if $bad_backup_filename->($base, $filename);
+
+        my $file = "$bdir/$filename";
+        return $json_err->($c, 404, 'Backup nicht gefunden') unless -f $file;
+
+        my $raw = path($file)->slurp;
+        my $txt = eval { decode('UTF-8', $raw, 1) };
+        if ($@) {
+            return $json_err->($c, 415, 'Backup ist nicht UTF-8 kodiert');
+        }
+
+        $c->render(json => { ok => 1, content => $txt });
+    };
+
+    post '/restore/*name/*filename' => sub {
+        my $c = shift;
+        my ($name, $filename) = ($c->stash('name'), $c->stash('filename'));
+
+        # FIX #8: bad_name() nur noch fuer 'name', eigene Validierung fuer 'filename'
+        return $json_err->($c, 400, 'Ungueltiger Name') if $bad_name->($name);
+
+        my $e = $cfgmap{$name} or return $json_err->($c, 404, "Unbekannte Konfiguration: $name");
+
+        my $base = path($e->{path})->basename;
+        my $bdir = $e->{backup_dir};
+
+        return $json_err->($c, 400, 'Ungueltiger Backup-Name')
+            if $bad_backup_filename->($base, $filename);
+
+        my $src  = "$bdir/$filename";
+        my $dest = $e->{path};
+
+        return $json_err->($c, 404, 'Backup nicht gefunden') unless -f $src;
+        return $json_err->($c, 400, 'Pfad nicht erlaubt') unless $is_allowed_path->($dest);
+
+        # FIX #3: Vor Restore Sicherheitsbackup des aktuellen Zielzustands erstellen.
+        # Vorher: kein Backup vor Restore - nach einem falschen Restore war der aktuelle Zustand weg.
+        # Jetzt: aktuellen Zielzustand sichern, bevor ueberschrieben wird.
+        if (-d $bdir && -f $dest) {
+            $create_backup_of->($dest, $bdir);
+        }
+
+        # FIX #2: Restore schreibt jetzt atomisch statt mit copy_to().
+        # Vorher: path($src)->copy_to($dest) - inkonsistent mit normalem Schreibpfad.
+        # Jetzt: Backup lesen und mit safe_write_file() atomar zurueckschreiben.
+        my $backup_bytes = eval { path($src)->slurp };
+        return $json_err->($c, 500, "Backup lesen fehlgeschlagen: $@") if $@;
+
+        eval { $safe_write_file->($dest, $backup_bytes); 1 }
+            or return $json_err->($c, 500, "Wiederherstellung fehlgeschlagen: $@");
+
+        eval { $apply_meta->($e, $dest); 1 } or $log->warn("Fehler bei apply_meta: $@");
+
+        my $applied_mode = $mode_str->($dest);
+        my ($uid, $gid)  = ((stat($dest))[4], (stat($dest))[5]);
+
+        my $meta_wanted = defined $e->{apply_meta}
+            ? $e->{apply_meta}
+            : ($apply_meta_enabled || defined($e->{user}) || defined($e->{group}) || defined($e->{mode}));
+
+        $c->render(json => {
+            ok       => 1,
+            restored => $name,
+            from     => $filename,
+            requested => {
+                user       => $e->{user},
+                group      => $e->{group},
+                mode       => $e->{mode},
+                apply_meta => ($meta_wanted ? Mojo::JSON::true : Mojo::JSON::false),
+            },
+            applied => { uid => $uid, gid => $gid, mode => $applied_mode }
+        });
+    };
+
+    post '/action/*name/*cmd' => sub {
+        my $c = shift;
+        my ($name, $cmd) = ($c->stash('name'), $c->stash('cmd'));
+
+        return $json_err->($c, 400, 'Ungueltige Anfrage') if $bad_name->($name);
+
+        my $e = $cfgmap{$name} or return $json_err->($c, 404, "Unbekannt");
+
+        my $svc          = $e->{service} // $name;
+        my $is_postmulti = ($svc =~ m{^exec:/usr/sbin/postmulti$});
+        my $actmap       = $e->{actions};
+
+        return $json_err->($c, 400, 'Aktion nicht erlaubt')
+            unless ref($actmap) eq 'HASH' && exists $actmap->{$cmd};
+
+        my @extra = @{$actmap->{$cmd}};
+        for (@extra) {
+            return $json_err->($c, 400, "Ungueltiges Argument") if $_ !~ /^[A-Za-z0-9._:+@\/=\-,]+$/;
+        }
+
+        my $p;
+
+        # Fall 1: postmulti
+        if ($is_postmulti) {
+            my ($bin) = ($svc =~ m{^exec:(/.+)$});
+
+            $p = $capture_cmd_promise->(30, $bin, @extra)->then(sub {
+                my ($res) = @_;
+
+                if ($cmd =~ /^(stop|start|reload|restart)$/) {
+                    select(undef, undef, undef, 0.6);
+                }
+
+                my @status_args = @{$actmap->{status} // []};
+                if (!@status_args) { @status_args = ('-i', $name, '-p', 'status'); }
+
+                return $capture_cmd_promise->(10, $bin, @status_args)->then(sub {
+                    my ($status_res) = @_;
+                    my $state = $parse_postmulti_status->($status_res->{out}, '', $status_res->{rc});
+
+                    my $ok = 0;
+                    if    ($cmd eq 'stop')   { $ok = ($state eq 'stopped') ? 1 : 0; }
+                    elsif ($cmd eq 'status') { $ok = 1; }
+                    else                     { $ok = ($state eq 'running') ? 1 : 0; }
+
+                    $c->render(json => {
+                        ok     => $ok,
+                        action => $cmd,
+                        status => $state,
+                        rc     => $res->{rc},
+                        output => $res->{out},
+                    });
+                });
+            });
+        }
+        # Fall 2: daemon-reload
+        elsif ($cmd eq 'daemon-reload') {
+            $p = $systemctl_promise->(30, @SYSTEMCTL_BASE, 'daemon-reload')->then(sub {
+                my $rc = shift;
+                $c->render(json => $rc == 0 ? { ok => 1 } : { ok => 0, error => "Rueckgabewert=$rc" });
+            });
+        }
+        # Fall 3: scripts (bash/sh/perl/exec)
+        elsif ($svc =~ m{^(bash|sh|perl|exec):(/.+)$}) {
+            my ($runner, $script) = ($1, $2);
+            return $json_err->($c, 404, "Skript nicht gefunden: $script") unless -f $script;
+
+            if ($runner eq 'exec' && $script =~ m{/systemctl$}) {
+                return $json_err->($c, 400, 'Subcommand verboten')
+                    if ($extra[0] // '') =~ /^(poweroff|reboot|halt)$/;
+            }
+
+            my @argv =
+                  $runner eq 'perl' ? ('/usr/bin/perl', $script, @extra)
+                : $runner eq 'bash' ? ('/bin/bash', $script, @extra)
+                : $runner eq 'sh'   ? ('/bin/sh',   $script, @extra)
+                :                    ($script, @extra);
+
+            $p = $capture_cmd_promise->(30, @argv)->then(sub {
+                my $res = shift;
+                my $rc  = $res->{rc};
+
+                if (($extra[0] // '') eq 'is-active') {
+                    $c->render(json => { ok => 1, status => ($rc == 0 ? 'running' : 'stopped'), rc => $rc });
+                } else {
+                    $c->render(json => { ok => ($rc == 0 ? 1 : 0), rc => $rc, output => $res->{out} });
+                }
+            });
+        }
+        # Fall 4: systemctl services
+        else {
+            if ($cmd eq 'stop_start') {
+                $p = $systemctl_promise->(30, @SYSTEMCTL_BASE, 'stop', $svc)
+                    ->then(sub { $systemctl_promise->(30, @SYSTEMCTL_BASE, 'start', $svc) });
+            }
+            elsif ($cmd eq 'restart') {
+                $p = $systemctl_promise->(30, @SYSTEMCTL_BASE, 'restart', $svc);
+            }
+            elsif ($cmd eq 'reload') {
+                $p = $systemctl_promise->(30, @SYSTEMCTL_BASE, 'is-active', $svc)->then(sub {
+                    my $rc = shift;
+                    return $systemctl_promise->(30, @SYSTEMCTL_BASE, 'reload', $svc) if $rc == 0;
+                    die "Dienst nicht aktiv\n";
+                });
+            }
+            elsif ($svc eq 'systemctl') {
+                return $json_err->($c, 400, 'Verboten') if $cmd =~ /^(poweroff|reboot|halt)$/;
+                $p = $systemctl_promise->(30, @SYSTEMCTL_BASE, $cmd, @extra);
+            }
+            else {
+                $p = $systemctl_promise->(30, @SYSTEMCTL_BASE, $cmd, $svc);
+            }
+
+            $p->then(sub {
+                my $rc = shift;
+
+                if ($cmd =~ /^(stop_start|restart|reload|start|stop)$/) {
+                    return $systemctl_promise->(30, @SYSTEMCTL_BASE, 'is-active', $svc)->then(sub {
+                        my $active_rc = shift;
+                        $c->render(json => {
+                            ok     => ($active_rc == 0 || $cmd eq 'stop') ? 1 : 0,
+                            action => $cmd,
+                            status => ($active_rc == 0 ? 'running' : 'stopped')
+                        });
+                    });
+                }
+
+                $c->render(json => { ok => ($rc == 0 ? 1 : 0), rc => $rc });
+            })->catch(sub {
+                my $err = shift;
+                $c->render(json => { ok => 0, error => "$err" }, status => 500);
+            });
+
+            return;
+        }
+
+        $p->catch(sub {
+            my $err = shift;
+            $log->error("Fehler bei Aktion $cmd: $err");
+            $c->render(json => { ok => 0, error => "Interner Fehler: $err" }, status => 500);
+        }) if $p;
+    };
+
+    get '/raw/configs' => sub { shift->render(data => path($configsfile)->slurp); };
+
+    post '/raw/configs' => sub {
+        my $c = shift;
+        my $raw = $c->req->body // '';
+
+        eval { $raw = $require_valid_utf8->($raw); 1 }
+            or return $json_err->($c, 415, "Ungueltiges UTF-8");
+
+        eval { decode_json($raw); 1 } or return $json_err->($c, 400, 'Ungueltiges JSON');
+
+        $safe_write_file->($configsfile, $raw);
+
+        my $newcfg = decode_json($raw);
+        $rebuild_cfgmap_from->($newcfg);
+
+        $c->render(json => { ok => 1, reload => 1 });
+    };
+
+    post '/raw/configs/reload' => sub {
+        my $c = shift;
+        my $cfg = eval { decode_json(path($configsfile)->slurp) } or return $json_err->($c, 500, 'JSON-Fehler');
+        $rebuild_cfgmap_from->($cfg);
+        $c->render(json => { ok => 1, reloaded => 1 });
+    };
+
+    del '/raw/configs/:name' => sub {
+        my $c = shift;
+        my $name = $c->stash('name');
+
+        return $json_err->($c, 400, 'Ungueltiger Name') if $bad_name->($name);
+
+        my $cfg = decode_json(path($configsfile)->slurp);
+        return $c->render(status => 404, json => { ok => 0 }) unless delete $cfg->{$name};
+
+        $safe_write_file->($configsfile, encode_json($cfg));
+        $rebuild_cfgmap_from->($cfg);
+
+        $c->render(json => { ok => 1 });
+    };
+
+    get '/health' => sub { shift->render(json => { ok => 1, status => 'ok' }); };
+    any '/*whatever' => sub { shift->render(json => { ok => 0, error => '404 Not Found' }, status => 404); };
+
+    # ---------------- hooks ----------------
+
+    app->hook(before_dispatch => sub {
+        my $c = shift;
+
+        # Request Metadaten stashen
+        $c->stash(req_id => sprintf('%x-%x-%04x', int(time() * 1000), $$, rand(0xffff)));
+        $c->stash(t0 => steady_time());
+        $c->stash(client_ip => $client_ip->($c));
+
+        # FIX #4: CORS restriktiver.
+        # Vorher: ohne allow_origins => Origin einfach spiegeln (alle Origins erlaubt).
+        # Jetzt:  ohne allow_origins => kein Access-Control-Allow-Origin Header (kein CORS).
+        #         Mit allow_origins  => nur explizit definierte Origins erhalten den Header.
+        my $origin = $c->req->headers->origin // '';
+        if (%ALLOW_ORIGIN && $origin && $ALLOW_ORIGIN{$origin}) {
+            $c->res->headers->header('Access-Control-Allow-Origin' => $origin);
+            $c->res->headers->header('Access-Control-Allow-Methods' => 'GET, POST, DELETE, OPTIONS');
+            $c->res->headers->header('Access-Control-Allow-Headers' => 'Content-Type, X-API-Token, Authorization');
+            $c->res->headers->header('Access-Control-Max-Age'       => '86400');
+        }
+        # Kein CORS-Header wenn Origin nicht erlaubt oder allow_origins leer
+
+        $log->info('REQUEST ' . $fmt_req->($c));
+
+        # Preflight OPTIONS Request direkt beantworten
+        return $c->render(text => '', status => 204) if $c->req->method eq 'OPTIONS';
+
+        # IP-Whitelist Pruefung
+        if ($allowed_ips && @{$allowed_ips}) {
+            my $rip = $c->stash('client_ip') // '';
+            unless (Net::CIDR::cidrlookup($rip, @{$allowed_ips})) {
+                $log->info('REQUEST ' . $fmt_req->($c) . ' -> 403 Forbidden');
+                return $c->render(status => 403, json => { ok => 0, error => 'Forbidden' });
+            }
+        }
+
+        # Authentifizierung (Bcrypt oder Plain)
+        if (defined $api_token && length $api_token) {
+            my $hdr    = $c->req->headers->header('X-API-Token') // '';
+            my $auth   = $c->req->headers->authorization // '';
+            my $bearer = $auth =~ /^Bearer\s+(.+)/i ? $1 : '';
+            my $token_received = $hdr || $bearer;
+
+            my $authenticated = 0;
+
+            if ($api_token =~ /^\$2[aby]\$\d{2}\$/) {
+                $authenticated = ($token_received && $verify_bcrypt->($token_received, $api_token)) ? 1 : 0;
+            } else {
+                $authenticated = ($token_received && secure_compare($token_received, $api_token)) ? 1 : 0;
+            }
+
+            unless ($authenticated) {
+                $log->info('REQUEST ' . $fmt_req->($c) . ' -> 401 Unauthorized');
+                return $c->render(status => 401, json => { ok => 0, error => 'Unauthorized' });
+            }
+        }
+    });
+
+    app->hook(after_dispatch => sub {
+        my $c = shift;
+        my $t0 = $c->stash('t0') // steady_time();
+        my $dt = steady_time() - $t0;
+        my $code = $c->res->code // 200;
+        $log->info(sprintf('RESPONSE %s status=%d time=%.3fs', $fmt_req->($c), $code, $dt));
+    });
+
+    my $cur_umask = sub { my $o = umask(); umask($o); return $o; };
+
+    $log->info(sprintf(
+        'START version=%s umask=%04o path_guard=%s apply_meta=%d entries=%d',
+        $VERSION, $cur_umask->(), $path_guard, ($apply_meta_enabled ? 1 : 0), scalar(keys %cfgmap)
+    ));
+
+    my $listen_url = "http://$global->{listen}";
+    if ($global->{ssl_enable}) {
+        $listen_url = "https://$global->{listen}?cert=$global->{ssl_cert_file}&key=$global->{ssl_key_file}";
+    }
+
+    app->start('daemon', '-l', $listen_url);
+}
