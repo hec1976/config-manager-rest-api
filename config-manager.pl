@@ -22,11 +22,10 @@ use IO::Select ();
 use POSIX qw(setpgid);
 use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
 
-
 {
     umask 0007;
 
-    our $VERSION     = '1.7.7-ultra-clean+utf8safe';
+    our $VERSION     = '1.8.1-hardened-compat';
     our $globalfile  = "$Bin/global.json";
     our $configsfile = "$Bin/configs.json";
 
@@ -52,7 +51,7 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         push @SYSTEMCTL_BASE, @f if @f;
     }
 
-    # Logging Datei (optional)
+    # Logging Datei optional
     my $logfile = $global->{logfile} // "/var/log/config-manager.log";
     my $logdir  = path($logfile)->dirname;
     if (!-d $logdir) {
@@ -71,15 +70,14 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
     my @secrets = ref($sec) eq 'ARRAY' ? @$sec : ($sec // 'change-this-long-random-secret-please');
     app->secrets(\@secrets);
     if (grep { defined($_) && $_ eq 'change-this-long-random-secret-please' } @secrets) {
-        $log->warn('[config-manager] WARNING: Standard-Mojolicious Secret wird verwendet! Bitte in global.json anpassen.');
+        $log->warn('[config-manager] WARNING: Standard-Mojolicious Secret wird verwendet. Bitte in global.json anpassen.');
     }
 
-    # Security / Settings
+    # Security und Settings
     my $api_token = (defined $ENV{API_TOKEN} && $ENV{API_TOKEN} ne '')
         ? $ENV{API_TOKEN}
         : $global->{api_token};
 
-    # Hart erzwingen: ohne Token kein Start
     die "FATAL: api_token fehlt. Setze global.json api_token oder ENV API_TOKEN.\n"
         unless defined $api_token && length $api_token;
 
@@ -89,23 +87,32 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
     my $backupRoot = $global->{backupDir} // "$Bin/backup";
     my $tmpDir     = $global->{tmpDir}    // "$Bin/tmp";
 
-    eval { path($backupRoot)->make_path; 1 } or die "Backup-Verzeichnis $backupRoot fehlt/nicht erstellbar";
+    eval { path($backupRoot)->make_path; 1 } or die "Backup-Verzeichnis $backupRoot fehlt oder ist nicht erstellbar";
     chmod 0750, $backupRoot if -d $backupRoot;
 
-    eval { path($tmpDir)->make_path; 1 } or die "Tmp-Verzeichnis $tmpDir fehlt/nicht erstellbar";
+    eval { path($tmpDir)->make_path; 1 } or die "Tmp-Verzeichnis $tmpDir fehlt oder ist nicht erstellbar";
     chmod 0750, $tmpDir if -d $tmpDir;
 
     my $maxBackups          = $global->{maxBackups} // 10;
-    my $path_guard          = lc($ENV{PATH_GUARD} // ($global->{path_guard} // 'off'));
+
+    # 1.8.1 Kompatibilitaetsfix
+    # Default wieder audit statt enforce, damit Altinstallationen nicht sofort brechen
+    my $path_guard          = lc($ENV{PATH_GUARD} // ($global->{path_guard} // 'audit'));
+
     my $apply_meta_enabled  = $global->{apply_meta} // 0;
     my $auto_create_backups = $global->{auto_create_backups} // 0;
+
+    # Wenn allow_origins leer ist, altes CORS Verhalten spiegeln
+    my $cors_reflect_if_empty = exists $global->{cors_reflect_if_empty}
+        ? ($global->{cors_reflect_if_empty} ? 1 : 0)
+        : 1;
 
     # Allowed roots canonical
     my @ALLOWED_CANON;
     if (ref($global->{allowed_roots}) eq 'ARRAY') {
         my %seen;
         for my $r (@{$global->{allowed_roots}}) {
-            my $rp = path($r)->realpath;
+            my $rp = eval { path($r)->realpath };
             next unless defined $rp && length $rp;
             $rp =~ s{/*$}{};
             $rp .= '/';
@@ -120,49 +127,54 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
 
     # ---------------- helpers ----------------
 
-	# Hilfsfunktion für Bcrypt-Verifizierung (kompatibel zu PHP password_hash)
-	my $verify_bcrypt = sub {
-		my ($plain, $hash) = @_;
-		return 0 unless defined $plain && defined $hash;
+    my $verify_bcrypt = sub {
+        my ($plain, $hash) = @_;
+        return 0 unless defined $plain && defined $hash;
+        return 0 unless $hash =~ /^\$2[aby]\$\d{2}\$[\.\/A-Za-z0-9]{53}$/;
 
-		# akzeptiere $2a$, $2y$, $2b$ und exakt 60 Zeichen Format
-		return 0 unless $hash =~ /^\$2[aby]\$\d{2}\$[\.\/A-Za-z0-9]{53}$/;
+        my $perl_safe_hash = $hash;
+        $perl_safe_hash =~ s/^\$2[yb]\$/\$2a\$/;
 
-		# Perl Modul kann je nach Build zickig sein mit 2y/2b, darum auf 2a normalisieren
-		my $perl_safe_hash = $hash;
-		$perl_safe_hash =~ s/^\$2[yb]\$/\$2a\$/;
+        my $settings = substr($perl_safe_hash, 0, 29);
+        return 0 unless length($settings) == 29;
 
-		# settings: "$2a$10$<22salt>" (29 chars)
-		my $settings = substr($perl_safe_hash, 0, 29);
-		return 0 unless length($settings) == 29;
+        my $calc;
+        my $ok = eval {
+            $calc = bcrypt($plain, $settings);
+            1;
+        };
+        return 0 unless $ok && defined $calc && length $calc;
 
-		my $calc;
-		my $ok = eval {
-			$calc = bcrypt($plain, $settings);
-			1;
-		};
-		return 0 unless $ok && defined $calc && length $calc;
+        $calc =~ s/^\$2a\$/\$2y\$/ if $hash =~ /^\$2y\$/;
+        $calc =~ s/^\$2a\$/\$2b\$/ if $hash =~ /^\$2b\$/;
 
-		# calc wieder auf original prefix bringen, dann compare gegen original hash
-		$calc =~ s/^\$2a\$/\$2y\$/ if $hash =~ /^\$2y\$/;
-		$calc =~ s/^\$2a\$/\$2b\$/ if $hash =~ /^\$2b\$/;
+        return secure_compare($calc, $hash) ? 1 : 0;
+    };
 
-		return secure_compare($calc, $hash) ? 1 : 0;
-	};
+    my $require_valid_utf8 = sub {
+        my ($v) = @_;
+        $v //= '';
 
-	# --- Helper: UTF-8 Validierung + Normalisierung ---
-	my $require_valid_utf8 = sub {
-		my ($v) = @_;
-		$v //= '';
+        my $bytes = utf8::is_utf8($v) ? encode('UTF-8', $v) : $v;
+        my $txt = decode('UTF-8', $bytes, 1);
+        die "Ungueltiges UTF-8 im Request" unless defined $txt;
 
-		my $bytes = utf8::is_utf8($v) ? encode('UTF-8', $v) : $v;
+        return encode('UTF-8', $txt);
+    };
 
-		my $txt = decode('UTF-8', $bytes, 1);
-		die "Ungueltiges UTF-8 im Request" unless defined $txt;
+    # Nur fuer Read Fallback bei Altdateien
+    my $decode_for_display = sub {
+        my ($raw) = @_;
+        $raw //= '';
 
-		return encode('UTF-8', $txt);
-	};	
+        my $txt = eval { decode('UTF-8', $raw, 1) };
+        return ($txt, 'utf-8') if defined $txt && !$@;
 
+        # Altverhalten und Editor Kompatibilitaet
+        # invalides UTF 8 nicht hart blockieren, sondern bytes als latin1nah anzeigen
+        my $fallback = decode('ISO-8859-1', $raw);
+        return ($fallback, 'latin1-fallback');
+    };
 
     my $bad_name = sub {
         my ($s) = @_;
@@ -174,6 +186,13 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         return 0;
     };
 
+    my $bad_backup_filename = sub {
+        my ($base, $filename) = @_;
+        return 1 unless defined $base && defined $filename;
+        return 0 if $filename =~ /^\Q$base\E\.bak\.(\d{8}_\d{6}|\d{14}|\d+)$/;
+        return 1;
+    };
+
     my $json_err = sub {
         my ($c, $code, $msg) = @_;
         $code ||= 400;
@@ -183,8 +202,10 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
     my $canon_dir_of_path = sub {
         my ($p) = @_;
         return undef unless defined $p && length $p;
-        my $rp = -e $p ? path($p)->realpath : path($p)->dirname->realpath;
+
+        my $rp = eval { -e $p ? path($p)->realpath : path($p)->dirname->realpath };
         return undef unless defined $rp && length $rp;
+
         $rp =~ s{/*$}{};
         $rp .= '/';
         return $rp;
@@ -197,7 +218,7 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
 
         if (!@ALLOWED_CANON) {
             if ($path_guard eq 'audit') {
-                $log->warn("PATH-GUARD audit: keine allowed_roots");
+                $log->warn("PATH-GUARD audit: keine allowed_roots fuer $p");
                 return 1;
             }
             return 0;
@@ -214,6 +235,7 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
             $log->warn("PATH-GUARD audit: $p ausserhalb allowed_roots");
             return 1;
         }
+
         return 0;
     };
 
@@ -228,6 +250,7 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         return undef unless defined $n && length $n;
         return $n =~ /^\d+$/ ? 0 + $n : scalar((getpwnam($n))[2]);
     };
+
     my $name2gid = sub {
         my ($n) = @_;
         return undef unless defined $n && length $n;
@@ -260,6 +283,7 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
             my $g = defined($gid) ? $gid : -1;
             chown($u, $g, $p) or die "chown fehlgeschlagen: $!";
         }
+
         chmod($mode, $p) if defined $mode;
         return 1;
     };
@@ -299,7 +323,6 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         my $file = path($p);
         my $tmp  = $file->dirname->child(".tmp_" . $file->basename . ".$$");
 
-        # UTF-8 Bytes erzwingen, falls Perl-String reinkommt
         $bytes = $to_utf8_bytes->($bytes);
 
         $tmp->spew($bytes);
@@ -309,14 +332,8 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
 
     my $safe_write_file = sub {
         my ($p, $bytes) = @_;
-        my $method = 'atomic';
-        my $ok = eval { $write_atomic->($p, $bytes); 1 };
-        if (!$ok) {
-            $method = 'plain';
-            $bytes = $to_utf8_bytes->($bytes);
-            path($p)->spew($bytes);
-        }
-        return $method;
+        $write_atomic->($p, $bytes);
+        return 'atomic';
     };
 
     my $systemctl_promise = sub {
@@ -377,11 +394,9 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
                     my ($bin, @args) = @cmd;
                     die "Missing command" unless defined $bin && length $bin;
 
-                    # Bin: absolut, ASCII, keine Spaces
                     die "Bad command path" unless $bin =~ m{\A/[A-Za-z0-9._/-]+\z};
                     die "Command not executable" unless -x $bin;
 
-                    # Args: enges Whitelisting, keine Spaces
                     for my $a (@args) {
                         die "Bad arg" unless defined $a && length $a;
                         die "Bad arg" unless $a =~ /\A[A-Za-z0-9._:+@\/=\-,]+\z/;
@@ -405,12 +420,10 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
                     $pid = open3(my $in, my $out, $errfh, $bin, @args);
                     close $in;
 
-                    # eigene Prozessgruppe
                     eval { setpgid($pid, $pid); 1 };
 
                     my $buf = '';
 
-                    # stdout/stderr parallel lesen (kein Deadlock)
                     my $sel = IO::Select->new();
                     $sel->add($out);
                     $sel->add($errfh);
@@ -552,6 +565,19 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
 
     $rebuild_cfgmap_from->($configs);
 
+    my $create_backup_of = sub {
+        my ($p, $bdir) = @_;
+        return unless -f $p;
+        my $ts    = $ts_compact->();
+        my $bfile = "$bdir/" . path($p)->basename . ".bak.$ts";
+        eval { path($p)->copy_to($bfile); 1 };
+        my $base = path($p)->basename;
+        my @b = sort { $b cmp $a } grep { defined } glob("$bdir/$base.bak.*");
+        if (@b > $maxBackups) {
+            unlink @b[$maxBackups .. $#b];
+        }
+    };
+
     # ---------------- routes ----------------
 
     get '/' => sub {
@@ -603,9 +629,14 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         return $json_err->($c, 400, "Pfad nicht erlaubt") unless $is_allowed_path->($p);
         return $json_err->($c, 404, "Datei fehlt: $p") unless -f $p;
 
-        # Editor freundlich: UTF-8 deklarieren
+        my $raw = eval { path($p)->slurp };
+        return $json_err->($c, 500, "Datei konnte nicht gelesen werden: $@") if $@;
+
+        my ($txt, $enc) = $decode_for_display->($raw);
+        $log->warn("CONFIG READ fallback-decoding fuer $p ($enc)") if $enc ne 'utf-8';
+
         $c->res->headers->content_type('text/plain; charset=utf-8');
-        $c->render(data => path($p)->slurp);
+        $c->render(data => encode('UTF-8', $txt));
     };
 
     post '/config/*name' => sub {
@@ -627,25 +658,18 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
             }
         }
 
-		eval { $content = $require_valid_utf8->($content); 1 }
-			or return $json_err->($c, 415, "Ungueltiges UTF-8");		
+        eval { $content = $require_valid_utf8->($content); 1 }
+            or return $json_err->($c, 415, "Ungueltiges UTF-8");
 
         my $bdir = $e->{backup_dir};
         if (!-d $bdir) {
-            if ($auto_create_backups) { $ensure_dir->($bdir, 0750); }
+            if ($auto_create_backups) {
+                $ensure_dir->($bdir, 0750);
+            }
             return $json_err->($c, 500, "Backup-Verzeichnis fehlt") unless -d $bdir;
         }
 
-        # backup wenn ziel existiert
-        if (-f $p) {
-            my $ts = $ts_compact->();
-            my $bfile = "$bdir/" . path($p)->basename . ".bak.$ts";
-            eval { path($p)->copy_to($bfile); 1 };
-
-            my $base = path($p)->basename;
-            my @b = sort { $b cmp $a } grep { defined } glob("$bdir/$base.bak.*");
-            if (@b > $maxBackups) { unlink @b[$maxBackups .. $#b]; }
-        }
+        $create_backup_of->($p, $bdir) if -f $p;
 
         my $method;
         eval { $method = $safe_write_file->($p, $content); 1 }
@@ -697,7 +721,7 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         my $c = shift;
         my ($name, $filename) = ($c->stash('name'), $c->stash('filename'));
 
-        return $json_err->($c, 400, 'Ungueltiger Name/Filename') if $bad_name->($name) || $bad_name->($filename);
+        return $json_err->($c, 400, 'Ungueltiger Name') if $bad_name->($name);
 
         my $e = $cfgmap{$name} or return $json_err->($c, 404, "Unbekannte Konfiguration: $name");
 
@@ -705,25 +729,25 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         my $base = path($e->{path})->basename;
 
         return $json_err->($c, 400, 'Ungueltiger Backup-Name')
-            unless $filename =~ /^\Q$base\E\.bak\.(\d{8}_\d{6}|\d{14}|\d+)$/;
+            if $bad_backup_filename->($base, $filename);
 
         my $file = "$bdir/$filename";
         return $json_err->($c, 404, 'Backup nicht gefunden') unless -f $file;
 
-        my $raw = path($file)->slurp;
-        my $txt = eval { decode('UTF-8', $raw, 1) };
-        if ($@) {
-            return $json_err->($c, 415, 'Backup ist nicht UTF-8 kodiert');
-        }
+        my $raw = eval { path($file)->slurp };
+        return $json_err->($c, 500, "Backup lesen fehlgeschlagen: $@") if $@;
 
-        $c->render(json => { ok => 1, content => $txt });
+        my ($txt, $enc) = $decode_for_display->($raw);
+        $log->warn("BACKUP READ fallback-decoding fuer $file ($enc)") if $enc ne 'utf-8';
+
+        $c->render(json => { ok => 1, content => $txt, encoding => $enc });
     };
 
     post '/restore/*name/*filename' => sub {
         my $c = shift;
         my ($name, $filename) = ($c->stash('name'), $c->stash('filename'));
 
-        return $json_err->($c, 400, 'Ungueltiger Name/Filename') if $bad_name->($name) || $bad_name->($filename);
+        return $json_err->($c, 400, 'Ungueltiger Name') if $bad_name->($name);
 
         my $e = $cfgmap{$name} or return $json_err->($c, 404, "Unbekannte Konfiguration: $name");
 
@@ -731,7 +755,7 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         my $bdir = $e->{backup_dir};
 
         return $json_err->($c, 400, 'Ungueltiger Backup-Name')
-            unless $filename =~ /^\Q$base\E\.bak\.(\d{8}_\d{6}|\d{14}|\d+)$/;
+            if $bad_backup_filename->($base, $filename);
 
         my $src  = "$bdir/$filename";
         my $dest = $e->{path};
@@ -739,7 +763,15 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         return $json_err->($c, 404, 'Backup nicht gefunden') unless -f $src;
         return $json_err->($c, 400, 'Pfad nicht erlaubt') unless $is_allowed_path->($dest);
 
-        path($src)->copy_to($dest) or return $json_err->($c, 500, "Wiederherstellung fehlgeschlagen: $!");
+        if (-d $bdir && -f $dest) {
+            $create_backup_of->($dest, $bdir);
+        }
+
+        my $backup_bytes = eval { path($src)->slurp };
+        return $json_err->($c, 500, "Backup lesen fehlgeschlagen: $@") if $@;
+
+        eval { $safe_write_file->($dest, $backup_bytes); 1 }
+            or return $json_err->($c, 500, "Wiederherstellung fehlgeschlagen: $@");
 
         eval { $apply_meta->($e, $dest); 1 } or $log->warn("Fehler bei apply_meta: $@");
 
@@ -786,7 +818,6 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
 
         my $p;
 
-        # Fall 1: postmulti
         if ($is_postmulti) {
             my ($bin) = ($svc =~ m{^exec:(/.+)$});
 
@@ -798,7 +829,9 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
                 }
 
                 my @status_args = @{$actmap->{status} // []};
-                if (!@status_args) { @status_args = ('-i', $name, '-p', 'status'); }
+                if (!@status_args) {
+                    @status_args = ('-i', $name, '-p', 'status');
+                }
 
                 return $capture_cmd_promise->(10, $bin, @status_args)->then(sub {
                     my ($status_res) = @_;
@@ -819,14 +852,12 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
                 });
             });
         }
-        # Fall 2: daemon-reload
         elsif ($cmd eq 'daemon-reload') {
             $p = $systemctl_promise->(30, @SYSTEMCTL_BASE, 'daemon-reload')->then(sub {
                 my $rc = shift;
                 $c->render(json => $rc == 0 ? { ok => 1 } : { ok => 0, error => "Rueckgabewert=$rc" });
             });
         }
-        # Fall 3: scripts (bash/sh/perl/exec)
         elsif ($svc =~ m{^(bash|sh|perl|exec):(/.+)$}) {
             my ($runner, $script) = ($1, $2);
             return $json_err->($c, 404, "Skript nicht gefunden: $script") unless -f $script;
@@ -853,7 +884,6 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
                 }
             });
         }
-        # Fall 4: systemctl services
         else {
             if ($cmd eq 'stop_start') {
                 $p = $systemctl_promise->(30, @SYSTEMCTL_BASE, 'stop', $svc)
@@ -913,12 +943,13 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         my $c = shift;
         my $raw = $c->req->body // '';
 
-		eval { $raw = $require_valid_utf8->($raw); 1 }
-			or return $json_err->($c, 415, "Ungueltiges UTF-8");		
+        eval { $raw = $require_valid_utf8->($raw); 1 }
+            or return $json_err->($c, 415, "Ungueltiges UTF-8");
 
         eval { decode_json($raw); 1 } or return $json_err->($c, 400, 'Ungueltiges JSON');
 
-        $safe_write_file->($configsfile, $raw);
+        eval { $safe_write_file->($configsfile, $raw); 1 }
+            or return $json_err->($c, 500, "configs.json konnte nicht geschrieben werden: $@");
 
         my $newcfg = decode_json($raw);
         $rebuild_cfgmap_from->($newcfg);
@@ -928,7 +959,8 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
 
     post '/raw/configs/reload' => sub {
         my $c = shift;
-        my $cfg = eval { decode_json(path($configsfile)->slurp) } or return $json_err->($c, 500, 'JSON-Fehler');
+        my $cfg = eval { decode_json(path($configsfile)->slurp) }
+            or return $json_err->($c, 500, 'JSON-Fehler');
         $rebuild_cfgmap_from->($cfg);
         $c->render(json => { ok => 1, reloaded => 1 });
     };
@@ -942,42 +974,51 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         my $cfg = decode_json(path($configsfile)->slurp);
         return $c->render(status => 404, json => { ok => 0 }) unless delete $cfg->{$name};
 
-        $safe_write_file->($configsfile, encode_json($cfg));
+        eval { $safe_write_file->($configsfile, encode_json($cfg)); 1 }
+            or return $json_err->($c, 500, "configs.json konnte nicht geschrieben werden: $@");
+
         $rebuild_cfgmap_from->($cfg);
 
         $c->render(json => { ok => 1 });
     };
 
     get '/health' => sub { shift->render(json => { ok => 1, status => 'ok' }); };
-    any '/*whatever' => sub { shift->render(json => { ok => 0, error => '404 Not Found' }, status => 404); };
+
+    any '/*whatever' => sub {
+        shift->render(json => { ok => 0, error => '404 Not Found' }, status => 404);
+    };
 
     # ---------------- hooks ----------------
 
-	app->hook(before_dispatch => sub {
+    app->hook(before_dispatch => sub {
         my $c = shift;
 
-        # Request Metadaten stashen
         $c->stash(req_id => sprintf('%x-%x-%04x', int(time() * 1000), $$, rand(0xffff)));
         $c->stash(t0 => steady_time());
         $c->stash(client_ip => $client_ip->($c));
 
-        # CORS Header setzen
-        my $origin = $c->req->headers->origin // '*';
+        my $origin = $c->req->headers->origin // '';
+
+        # 1.8.1 Kompatibilitaetsfix fuer UI und getrennte Frontends
         if (%ALLOW_ORIGIN) {
-            $c->res->headers->header('Access-Control-Allow-Origin' => ($ALLOW_ORIGIN{$origin} ? $origin : 'null'));
-        } else {
-            $c->res->headers->header('Access-Control-Allow-Origin' => $origin);
+            if ($origin && $ALLOW_ORIGIN{$origin}) {
+                $c->res->headers->header('Access-Control-Allow-Origin' => $origin);
+            }
+        } elsif ($cors_reflect_if_empty) {
+            my $reflect = $origin || '*';
+            $c->res->headers->header('Access-Control-Allow-Origin' => $reflect);
         }
-        $c->res->headers->header('Access-Control-Allow-Methods' => 'GET, POST, DELETE, OPTIONS');
-        $c->res->headers->header('Access-Control-Allow-Headers' => 'Content-Type, X-API-Token, Authorization');
-        $c->res->headers->header('Access-Control-Max-Age'       => '86400');
+
+        if ($c->res->headers->header('Access-Control-Allow-Origin')) {
+            $c->res->headers->header('Access-Control-Allow-Methods' => 'GET, POST, DELETE, OPTIONS');
+            $c->res->headers->header('Access-Control-Allow-Headers' => 'Content-Type, X-API-Token, Authorization');
+            $c->res->headers->header('Access-Control-Max-Age'       => '86400');
+        }
 
         $log->info('REQUEST ' . $fmt_req->($c));
-        
-        # Preflight OPTIONS Request direkt beantworten
+
         return $c->render(text => '', status => 204) if $c->req->method eq 'OPTIONS';
 
-        # IP-Whitelist Prüfung
         if ($allowed_ips && @{$allowed_ips}) {
             my $rip = $c->stash('client_ip') // '';
             unless (Net::CIDR::cidrlookup($rip, @{$allowed_ips})) {
@@ -986,25 +1027,24 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
             }
         }
 
-        # Authentifizierung (Bcrypt oder Plain)
         if (defined $api_token && length $api_token) {
             my $hdr    = $c->req->headers->header('X-API-Token') // '';
             my $auth   = $c->req->headers->authorization // '';
             my $bearer = $auth =~ /^Bearer\s+(.+)/i ? $1 : '';
             my $token_received = $hdr || $bearer;
 
-			my $authenticated = 0;
+            my $authenticated = 0;
 
-			if ($api_token =~ /^\$2[aby]\$\d{2}\$/) {
-				$authenticated = ($token_received && $verify_bcrypt->($token_received, $api_token)) ? 1 : 0;
-			} else {
-				$authenticated = ($token_received && secure_compare($token_received, $api_token)) ? 1 : 0;
-			}
+            if ($api_token =~ /^\$2[aby]\$\d{2}\$/) {
+                $authenticated = ($token_received && $verify_bcrypt->($token_received, $api_token)) ? 1 : 0;
+            } else {
+                $authenticated = ($token_received && secure_compare($token_received, $api_token)) ? 1 : 0;
+            }
 
-			unless ($authenticated) {
-				$log->info('REQUEST ' . $fmt_req->($c) . ' -> 401 Unauthorized');
-				return $c->render(status => 401, json => { ok => 0, error => 'Unauthorized' });
-			}
+            unless ($authenticated) {
+                $log->info('REQUEST ' . $fmt_req->($c) . ' -> 401 Unauthorized');
+                return $c->render(status => 401, json => { ok => 0, error => 'Unauthorized' });
+            }
         }
     });
 
@@ -1016,11 +1056,20 @@ use Crypt::Eksblowfish::Bcrypt qw(bcrypt);
         $log->info(sprintf('RESPONSE %s status=%d time=%.3fs', $fmt_req->($c), $code, $dt));
     });
 
-    my $cur_umask = sub { my $o = umask(); umask($o); return $o; };
+    my $cur_umask = sub {
+        my $o = umask();
+        umask($o);
+        return $o;
+    };
 
     $log->info(sprintf(
-        'START version=%s umask=%04o path_guard=%s apply_meta=%d entries=%d',
-        $VERSION, $cur_umask->(), $path_guard, ($apply_meta_enabled ? 1 : 0), scalar(keys %cfgmap)
+        'START version=%s umask=%04o path_guard=%s apply_meta=%d entries=%d cors_reflect_if_empty=%d',
+        $VERSION,
+        $cur_umask->(),
+        $path_guard,
+        ($apply_meta_enabled ? 1 : 0),
+        scalar(keys %cfgmap),
+        $cors_reflect_if_empty
     ));
 
     my $listen_url = "http://$global->{listen}";
